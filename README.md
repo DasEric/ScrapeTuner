@@ -18,7 +18,9 @@
 
 ## Quick Start (Docker Compose)
 
-The easiest way to run ScrapeTuner is using Docker Compose. The pre-built Docker image is available on Docker Hub: [DasEric/ScrapeTuner](https://hub.docker.com/r/DasEric/ScrapeTuner).
+The easiest way to run ScrapeTuner is using Docker Compose. 
+
+The pre-built Docker image is available on Docker Hub: [DasEric/ScrapeTuner](https://hub.docker.com/r/DasEric/ScrapeTuner).
 
 1. Create a `compose.yaml` file:
    ```yaml
