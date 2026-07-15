@@ -1,0 +1,5 @@
+#EXTM3U
+# Nur eigene bzw. ausdrücklich erlaubte Stream-URLs eintragen.
+# tvg-id muss zum channel id in guide.xml passen.
+#EXTINF:-1 tvg-id="demo-1" tvg-chno="1" group-title="Demo",Mein erlaubter Sender
+https://example.invalid/live/stream.m3u8

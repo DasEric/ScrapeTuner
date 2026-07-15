@@ -1,0 +1,14 @@
+services:
+  scrapetuner:
+    image: DasEric/ScrapeTuner:latest
+    container_name: scrapetuner
+    restart: unless-stopped
+    ports:
+      - "5004:5004"
+    volumes:
+      - ./config:/config
+    environment:
+      # Leave empty: the tuner automatically derives the host IP.
+      # If using reverse proxy or multiple networks, set the LAN IP, e.g.
+      # PUBLIC_BASE_URL: http://192.168.178.50:5004
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}

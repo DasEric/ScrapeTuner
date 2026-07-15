@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<tv generator-info-name="iptv-tuner">
+  <channel id="demo-1">
+    <display-name>Mein erlaubter Sender</display-name>
+  </channel>
+</tv>
