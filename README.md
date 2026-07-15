@@ -89,6 +89,28 @@ https://stream.example.org/live/master.m3u8
 
 ---
 
+## NAS Deployment & Troubleshooting (Crucial)
+
+If you are running ScrapeTuner on a Linux-based NAS (like **Ugreen UGOS**, **Synology DSM**, or **QNAP QTS**) alongside Plex/Jellyfin in Docker, pay close attention to the following network requirements:
+
+### 1. Host Network Mode Requirement
+Plex and ScrapeTuner often run on the same machine. In default `bridge` network mode, Docker disables NAT loopback (hairpin NAT). This means Plex cannot connect back to the host's physical IP address to reach the tuner container, causing playback to fail with a *"Channel could not be tuned"* error.
+- **Solution:** Always run ScrapeTuner in **Host Network Mode** (`network_mode: host` in Docker Compose, or Selecting `host` network in the NAS Docker GUI).
+
+### 2. Recreating the Container
+If you switch a container from `bridge` to `host` network mode (or vice versa), **you must delete and recreate the container**. Simply restarting or updating the container will *not* apply the network mode change in Docker. 
+- **Docker Compose:** Run `docker compose down && docker compose up -d` to automatically recreate the container.
+- **NAS GUI:** Stop the container, delete it, and recreate a new container with the network set to `host`.
+
+### 3. Base URL Formatting
+Make sure the `PUBLIC_BASE_URL` environment variable is fully formatted as:
+`http://<YOUR-NAS-IP>:5004` (e.g. `http://10.0.0.6:5004`).
+- Ensure it contains the `http://` prefix.
+- Ensure it contains the port `:5004` at the end.
+*(Note: ScrapeTuner contains built-in fallback checks that will automatically prepend `http://` if it is missing, but it is best practice to configure it correctly).*
+
+---
+
 ## Network & Privacy Note
 
 - **Local Network Use Only:** The proxy re-routes HLS video packets through the container to serve them as MPEG-TS. Never expose port `5004` to the public internet.
