@@ -248,6 +248,8 @@ def parse_playlist() -> list[Channel]:
 def public_base(handler: BaseHTTPRequestHandler) -> str:
     configured = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
     if configured:
+        if not configured.startswith(("http://", "https://")):
+            configured = "http://" + configured
         return configured
     host = handler.headers.get("Host", f"{handler.server.server_address[0]}:{PORT}")
     return f"http://{host}"
