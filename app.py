@@ -8,6 +8,7 @@ import mimetypes
 import os
 import re
 import socket
+import subprocess
 import time
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -22,6 +23,55 @@ PORT = int(os.environ.get("PORT", "5004"))
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", "/config"))
 PLAYLIST = CONFIG_DIR / "channels.m3u"
 GUIDE = CONFIG_DIR / "guide.xml"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+# Load/create config.json in the mounted config directory
+config_data = {
+    "PORT": PORT,
+    "PUBLIC_BASE_URL": os.environ.get("PUBLIC_BASE_URL", ""),
+    "TRANSCODE_UPSCALING": os.environ.get("TRANSCODE_UPSCALING", "false").lower() == "true",
+    "TRANSCODE_RESOLUTION": os.environ.get("TRANSCODE_RESOLUTION", "1920x1080"),
+    "TRANSCODE_SHARPEN": 0.5,
+    "TRANSCODE_DENOISE": 1.0
+}
+
+# Try reading from config.json if it exists
+if CONFIG_FILE.exists():
+    try:
+        loaded = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        # Merge loaded config, converting types appropriately
+        if "PORT" in loaded:
+            config_data["PORT"] = int(loaded["PORT"])
+        if "PUBLIC_BASE_URL" in loaded:
+            config_data["PUBLIC_BASE_URL"] = str(loaded["PUBLIC_BASE_URL"])
+        if "TRANSCODE_UPSCALING" in loaded:
+            val = loaded["TRANSCODE_UPSCALING"]
+            config_data["TRANSCODE_UPSCALING"] = val if isinstance(val, bool) else str(val).lower() == "true"
+        if "TRANSCODE_RESOLUTION" in loaded:
+            config_data["TRANSCODE_RESOLUTION"] = str(loaded["TRANSCODE_RESOLUTION"])
+        if "TRANSCODE_SHARPEN" in loaded:
+            config_data["TRANSCODE_SHARPEN"] = float(loaded["TRANSCODE_SHARPEN"])
+        if "TRANSCODE_DENOISE" in loaded:
+            config_data["TRANSCODE_DENOISE"] = float(loaded["TRANSCODE_DENOISE"])
+        print(f"INFO: Loaded configuration from {CONFIG_FILE.name}", flush=True)
+    except Exception as e:
+        print(f"WARNING: Error reading config.json ({e}), using environment defaults.", flush=True)
+else:
+    # Save default config.json as a template
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(json.dumps(config_data, indent=2), encoding="utf-8")
+        print(f"INFO: Created default configuration template at {CONFIG_FILE.name}", flush=True)
+    except Exception as e:
+        print(f"WARNING: Could not write default config.json template ({e})", flush=True)
+
+# Assign settings to constants
+PORT = config_data["PORT"]
+PUBLIC_BASE_URL_CONFIG = config_data["PUBLIC_BASE_URL"]
+TRANSCODE_UPSCALING = config_data["TRANSCODE_UPSCALING"]
+TRANSCODE_RESOLUTION = config_data["TRANSCODE_RESOLUTION"]
+TRANSCODE_SHARPEN = config_data["TRANSCODE_SHARPEN"]
+TRANSCODE_DENOISE = config_data["TRANSCODE_DENOISE"]
 
 
 @dataclass(frozen=True)
@@ -189,7 +239,7 @@ def get_2ix2_channels() -> list[Channel]:
             number=num,
             name=name,
             url=url,
-            tvg_id=EPG_ID_MAP.get(slug, f"2ix2-{slug}"),
+            tvg_id=EPG_ID_MAP.get(slug.lower(), f"2ix2-{slug}"),
             logo=logo
         ))
 
@@ -246,7 +296,7 @@ def parse_playlist() -> list[Channel]:
 
 
 def public_base(handler: BaseHTTPRequestHandler) -> str:
-    configured = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+    configured = PUBLIC_BASE_URL_CONFIG.rstrip("/")
     if configured:
         if not configured.startswith(("http://", "https://")):
             configured = "http://" + configured
@@ -413,6 +463,75 @@ class TunerHandler(BaseHTTPRequestHandler):
 
     def stream_hls_as_ts(self, m3u8_url: str) -> None:
         """Stream HLS playlist segments as a continuous MPEG-TS stream to the client."""
+        if TRANSCODE_UPSCALING:
+            # Parse target resolution dimensions
+            width, height = 1920, 1080
+            if "x" in TRANSCODE_RESOLUTION:
+                try:
+                    w_str, h_str = TRANSCODE_RESOLUTION.lower().split("x", 1)
+                    width, height = int(w_str), int(h_str)
+                except ValueError:
+                    pass
+
+            # Build ffmpeg filters: denoise -> scale -> sharpen
+            # hqdn3d removes digital compression blockiness before scaling/sharpening
+            vf_filters = []
+            if TRANSCODE_DENOISE > 0.0:
+                # scale parameters relative to TRANSCODE_DENOISE strength
+                luma_sp = TRANSCODE_DENOISE * 1.5
+                chroma_sp = TRANSCODE_DENOISE * 1.5
+                luma_tmp = TRANSCODE_DENOISE * 3.0
+                chroma_tmp = TRANSCODE_DENOISE * 3.0
+                vf_filters.append(f"hqdn3d={luma_sp}:{chroma_sp}:{luma_tmp}:{chroma_tmp}")
+            
+            vf_filters.append(f"scale={width}:{height}:flags=lanczos")
+            
+            if TRANSCODE_SHARPEN > 0.0:
+                vf_filters.append(f"unsharp=5:5:{TRANSCODE_SHARPEN}:5:5:0.0")
+
+            vf = ",".join(vf_filters)
+
+            # Execute ffmpeg reading the HLS manifest directly and outputting MPEG-TS to stdout
+            cmd = [
+                "ffmpeg",
+                "-re",                              # Read input at native frame rate
+                "-i", m3u8_url,                     # Input HLS stream
+                "-vf", vf,                          # Video filters (scale + sharpen)
+                "-c:v", "libx264",                  # Encode video to H.264
+                "-preset", "ultrafast",             # Minimize CPU load (crucial for NAS)
+                "-tune", "zerolatency",             # Keep latency as low as possible
+                "-c:a", "copy",                     # Copy audio stream losslessly
+                "-f", "mpegts",                     # Output container format
+                "pipe:1"                            # Output to stdout
+            ]
+
+            print(f"Launching ffmpeg upscaler: {' '.join(cmd)}", flush=True)
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            except Exception as e:
+                print(f"Error launching ffmpeg upscaler: {e}", flush=True)
+                self.send_error(HTTPStatus.BAD_GATEWAY, f"Failed to launch ffmpeg upscaler: {e}")
+                return
+
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "video/mp2t")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+
+            try:
+                while True:
+                    chunk = proc.stdout.read(64 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                print("Client disconnected from upscaled TS stream", flush=True)
+            finally:
+                proc.terminate()
+                proc.wait()
+            return
+
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "video/mp2t")
         self.send_header("Cache-Control", "no-store")
@@ -510,5 +629,17 @@ class TunerHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.BAD_GATEWAY, f"Upstream stream error: {error}")
 
 
+import shutil
+
 if __name__ == "__main__":
+    # Check if ffmpeg is available on startup to help users debug container updates
+    ffmpeg_found = shutil.which("ffmpeg") is not None
+    if ffmpeg_found:
+        print("INFO: 'ffmpeg' found on system path. ScrapeTuner is ready for real-time video upscaling.", flush=True)
+    else:
+        if TRANSCODE_UPSCALING:
+            print("WARNING: TRANSCODE_UPSCALING is set to True, but 'ffmpeg' was NOT found on the system path! Upscaling will fail.", flush=True)
+        else:
+            print("INFO: 'ffmpeg' not found. ScrapeTuner will run in native pass-through mode.", flush=True)
+
     ThreadingHTTPServer(("0.0.0.0", PORT), TunerHandler).serve_forever()

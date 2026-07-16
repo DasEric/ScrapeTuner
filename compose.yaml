@@ -12,3 +12,8 @@ services:
       # If using reverse proxy or multiple networks, set the LAN IP, e.g.
       # PUBLIC_BASE_URL: http://192.168.178.50:5004
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      # Optional Video Upscaling & Sharpening (High CPU!)
+      TRANSCODE_UPSCALING: "false"
+      TRANSCODE_RESOLUTION: "1920x1080"
+      TRANSCODE_SHARPEN: "0.5"
+      TRANSCODE_DENOISE: "1.0"

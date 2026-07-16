@@ -36,6 +36,11 @@ The pre-built Docker image is available on Docker Hub: [DasEric/ScrapeTuner](htt
          - PORT=5004
          - CONFIG_DIR=/config
          - PUBLIC_BASE_URL=http://<YOUR-HOST-IP>:5004
+         # Optional Real-Time Video Upscaling & Sharpening
+         - TRANSCODE_UPSCALING=false
+         - TRANSCODE_RESOLUTION=1920x1080
+         - TRANSCODE_SHARPEN=0.5
+         - TRANSCODE_DENOISE=1.0
        restart: unless-stopped
    ```
 2. Start the container:
@@ -43,6 +48,19 @@ The pre-built Docker image is available on Docker Hub: [DasEric/ScrapeTuner](htt
    docker compose up -d
    ```
    *(Note: You can still build it locally using `build: .` in your compose file and running `docker compose up -d --build` if you prefer).*
+
+### Optional Real-Time Video Upscaling & Sharpening (Experimental)
+> [!IMPORTANT]
+> **This feature is experimental.** Transcoding live streams in real-time is extremely resource-intensive. Depending on your CPU performance and stream conditions, **it can lead to errors, stream stuttering, buffering, or high CPU spikes.**
+
+If you enable `TRANSCODE_UPSCALING=true`, ScrapeTuner will route HLS video frames through `ffmpeg` inside the container:
+* **`TRANSCODE_UPSCALING`**: Enable (`true`) or disable (`false`, default) the real-time transcoding pipeline.
+* **`TRANSCODE_RESOLUTION`**: Target dimension for Lanczos scaling (e.g. `1920x1080` for Full HD, `1280x720` for HD).
+* **`TRANSCODE_SHARPEN`**: Sharpening filter strength (from `0.0` to `1.5`, default is `0.5`). Set to `0.0` to turn off sharpening.
+* **`TRANSCODE_DENOISE`**: Denoising filter strength (from `0.0` to `2.0`, default is `1.0`). Uses `hqdn3d` to smooth out blocky compression noise before scaling and sharpening. Set to `0.0` to turn off denoising.
+
+> [!WARNING]
+> Real-time video encoding consumes high CPU resources. Enabling this on a budget NAS can cause buffering or 100% CPU spikes. Disabling it runs the tuner in a lightweight, zero-CPU pass-through mode. If you experience lags or playback failures, disable upscaling.
 3. Verify the endpoints are running:
    - Discovery: `http://<YOUR-HOST-IP>:5004/discover.json`
    - Tuner lineup: `http://<YOUR-HOST-IP>:5004/lineup.json`
@@ -88,6 +106,26 @@ https://www.2ix2.com/pro-7/
 #EXTINF:-1 tvg-id="custom-stream" tvg-chno="10056" group-title="TV",My Local Stream
 https://stream.example.org/live/master.m3u8
 ```
+
+---
+
+## File-Based Configuration (`config.json`)
+
+To make configuration on NAS systems as easy as possible, ScrapeTuner supports loading configurations directly from a file inside your mounted `/config` directory:
+
+1. **Auto-Generated Template:** Upon the first startup, ScrapeTuner automatically creates a file named **`config.json`** inside your mounted `./config` folder.
+2. **Easy Customization:** You can edit this file on your NAS using any text editor. It contains all settings in a clean JSON format:
+   ```json
+   {
+     "PORT": 5004,
+     "PUBLIC_BASE_URL": "http://10.0.0.6:5004",
+     "TRANSCODE_UPSCALING": false,
+     "TRANSCODE_RESOLUTION": "1920x1080",
+     "TRANSCODE_SHARPEN": 0.5,
+     "TRANSCODE_DENOISE": 1.0
+   }
+   ```
+3. **No Docker Settings Needed:** Changing values inside this file and restarting the container will apply your settings immediately. You do not need to configure environment variables in your NAS Docker GUI.
 
 ---
 
