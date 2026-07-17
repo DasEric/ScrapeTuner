@@ -87,6 +87,9 @@ TRANSCODE_SHARPEN = config_data["TRANSCODE_SHARPEN"]
 TRANSCODE_DENOISE = config_data["TRANSCODE_DENOISE"]
 SCRAPER_PROVIDERS = config_data["SCRAPER_PROVIDERS"]
 
+import shutil
+FFMPEG_FOUND = shutil.which("ffmpeg") is not None
+
 
 @dataclass
 class Channel:
@@ -234,6 +237,18 @@ def normalize_slug(slug: str) -> str:
     # Remove all non-alphanumeric characters
     cleaned = re.sub(r'[^a-z0-9]', '', cleaned)
     return cleaned
+
+
+def get_provider_headers(provider: str) -> dict[str, str]:
+    prov = provider.lower().strip()
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    if prov in ("livedetv", "livedetv.com"):
+        return {"User-Agent": ua, "Referer": "https://www.livedetv.com/"}
+    elif prov in ("2ix2tv", "nydus", "lolmt2", "raidrush"):
+        return {"User-Agent": ua, "Referer": "https://2ix2tv.de/"}
+    elif prov in ("2ix2", "2ix2.com"):
+        return {"User-Agent": ua, "Referer": "https://www.2ix2.com/"}
+    return {"User-Agent": ua, "Accept": "*/*"}
 
 
 def lookup_name(parsed_name: str) -> str:
@@ -723,148 +738,173 @@ class TunerHandler(BaseHTTPRequestHandler):
                 return
             # Priority-based stream failover/resolution loop
             stream_url = ""
+            stream_headers = {}
             resolved_success = False
             
-            for provider in SCRAPER_PROVIDERS:
+            # If the channel came from a custom playlist file, it won't have provider_urls mapped.
+            # In that case, we directly try to validate the primary URL.
+            urls_to_try = []
+            if channel.provider_urls:
+                for provider in SCRAPER_PROVIDERS:
+                    prov_key = provider.lower().strip()
+                    if prov_key in channel.provider_urls:
+                        urls_to_try.append((provider, channel.provider_urls[prov_key]))
+            else:
+                urls_to_try.append(("CustomM3U", channel.url))
+                
+            for provider, prov_url in urls_to_try:
+                print(f"INFO: Attempting to resolve stream for '{channel.name}' via provider '{provider}'...", flush=True)
+                resolved = ""
+                
                 prov_key = provider.lower().strip()
-                # Check if this provider offers a source link for the target channel
-                if prov_key in channel.provider_urls:
-                    prov_url = channel.provider_urls[prov_key]
-                    print(f"INFO: Attempting to resolve stream for '{channel.name}' via provider '{provider}'...", flush=True)
-                    resolved = ""
+                if prov_key in ("2ix2tv", "nydus", "lolmt2", "raidrush"):
+                    slug = prov_url.rstrip("/").rsplit("/", 1)[-1]
+                    resolved = resolve_2ix2tv_stream(slug)
+                elif prov_key in ("livedetv", "livedetv.com"):
+                    resolved = resolve_livedetv_stream(prov_url)
+                elif prov_key in ("2ix2", "2ix2.com"):
+                    resolved = resolve_2ix2_stream(prov_url)
+                else:
+                    # Custom M3U or direct HLS URL
+                    resolved = prov_url
                     
-                    if prov_key in ("2ix2tv", "nydus", "lolmt2", "raidrush"):
-                        slug = prov_url.rstrip("/").rsplit("/", 1)[-1]
-                        resolved = resolve_2ix2tv_stream(slug)
-                    elif prov_key in ("livedetv", "livedetv.com"):
-                        resolved = resolve_livedetv_stream(prov_url)
-                    elif prov_key in ("2ix2", "2ix2.com"):
-                        resolved = resolve_2ix2_stream(prov_url)
+                if resolved:
+                    if "challenges.cloudflare.com" in resolved or "/embed.php" in resolved:
+                        print(f"WARNING: Stream for '{channel.name}' on provider '{provider}' is protected by Cloudflare and cannot be tuned directly.", flush=True)
+                        continue
                         
-                    if resolved:
-                        # Quick sanity check: did it resolve to a Cloudflare challenge wrapper?
-                        if "challenges.cloudflare.com" in resolved or "/embed.php" in resolved:
-                            print(f"WARNING: Stream for '{channel.name}' on provider '{provider}' is protected by Cloudflare and cannot be tuned directly.", flush=True)
-                            # Fall through to next provider
-                            continue
-                        
-                        stream_url = resolved
-                        resolved_success = True
-                        print(f"INFO: Successfully resolved stream for '{channel.name}' via provider '{provider}': {stream_url}", flush=True)
-                        break
-                    else:
-                        print(f"WARNING: Resolution for '{channel.name}' via provider '{provider}' failed or returned empty.", flush=True)
+                    # Validate the resolved stream URL immediately inside the loop
+                    headers = get_provider_headers(provider)
+                    req = Request(resolved, headers=headers)
+                    try:
+                        with urlopen(req, timeout=8) as response:
+                            content_type = response.headers.get_content_type()
+                            body_bytes = response.read()
+                            body_str = body_bytes.decode("utf-8", errors="ignore")
+                            resolved_url = response.url
+                            
+                            is_hls = content_type in {"application/vnd.apple.mpegurl", "application/x-mpegurl"} or urlparse(resolved).path.lower().endswith(".m3u8") or "#EXTM3U" in body_str
+                            
+                            if is_hls:
+                                # Extract child playlist if it is a master playlist
+                                if "#EXT-X-STREAM-INF:" in body_str:
+                                    video_url = ""
+                                    for line in body_str.splitlines():
+                                        line = line.strip()
+                                        if line and not line.startswith("#"):
+                                            video_url = urljoin(resolved_url, line)
+                                            break
+                                    if video_url:
+                                        if "/proxy?url=" in video_url:
+                                            video_url = unquote(video_url.split("/proxy?url=", 1)[1])
+                                        resolved = video_url
+                                
+                            stream_url = resolved
+                            stream_headers = headers
+                            resolved_success = True
+                            print(f"INFO: Successfully validated stream for '{channel.name}' via provider '{provider}': {stream_url}", flush=True)
+                            break
+                    except Exception as e:
+                        print(f"WARNING: Stream validation failed for '{channel.name}' on provider '{provider}' ({e}). Trying next fallback...", flush=True)
+                else:
+                    print(f"WARNING: Resolution for '{channel.name}' via provider '{provider}' failed or returned empty. Trying next fallback...", flush=True)
             
             if not resolved_success:
-                print(f"ERROR: Stream for '{channel.name}' could not be resolved by any of the configured providers: {SCRAPER_PROVIDERS}", flush=True)
+                print(f"ERROR: Stream for '{channel.name}' could not be resolved or validated by any of the configured providers: {SCRAPER_PROVIDERS}", flush=True)
                 self.send_error(HTTPStatus.BAD_GATEWAY, f"Stream for '{channel.name}' is currently not available on any providers.")
                 return
 
-            # Pre-resolve HLS to check if it's a playlist or needs master playlist resolution
-            is_hls = False
-            req = Request(stream_url, headers={"User-Agent": "IPTV-Tuner/1.0", "Accept": "*/*"})
-            try:
-                with urlopen(req, timeout=10) as response:
-                    content_type = response.headers.get_content_type()
-                    is_hls = content_type in {"application/vnd.apple.mpegurl", "application/x-mpegurl"} or urlparse(stream_url).path.lower().endswith(".m3u8")
-                    if is_hls:
-                        body_bytes = response.read()
-                        body_str = body_bytes.decode("utf-8", errors="ignore")
-                        resolved_url = response.url
-
-                        # If it is a master playlist, extract the child playlist
-                        if "#EXT-X-STREAM-INF:" in body_str:
-                            video_url = ""
-                            for line in body_str.splitlines():
-                                line = line.strip()
-                                if line and not line.startswith("#"):
-                                    video_url = urljoin(resolved_url, line)
-                                    break
-                            if video_url:
-                                if "/proxy?url=" in video_url:
-                                    video_url = unquote(video_url.split("/proxy?url=", 1)[1])
-                                stream_url = video_url
-                            else:
-                                stream_url = resolved_url
-                        else:
-                            stream_url = resolved_url
-            except Exception as e:
-                print(f"Error pre-resolving HLS stream: {e}", flush=True)
-
+            # Determine HLS
+            is_hls = urlparse(stream_url).path.lower().endswith(".m3u8") or "index.m3u8" in stream_url or "playlist.m3u8" in stream_url
+            
             if is_hls:
                 print(f"Starting continuous HLS-to-TS stream for: {stream_url}", flush=True)
-                self.stream_hls_as_ts(stream_url)
+                self.stream_hls_as_ts(stream_url, stream_headers)
             else:
-                self.proxy(stream_url, base)
+                self.proxy(stream_url, base, stream_headers)
         elif path == "/proxy":
             target = unquote(parsed.query.removeprefix("url="))
             if not target.startswith(("http://", "https://")):
                 self.send_error(HTTPStatus.BAD_REQUEST, "Only HTTP(S) stream URLs are supported")
                 return
-            self.proxy(target, base)
+            # Default headers for generic proxy requests
+            self.proxy(target, base, {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "Accept": "*/*"})
         elif path in ("/", "/health"):
             self.send_json({"status": "ok", "channels": len(parse_playlist())})
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 
-    def stream_hls_as_ts(self, m3u8_url: str) -> None:
+    def stream_hls_as_ts(self, m3u8_url: str, stream_headers: dict[str, str]) -> None:
         """Stream HLS playlist segments as a continuous MPEG-TS stream to the client."""
-        if TRANSCODE_UPSCALING:
-            # Parse target resolution dimensions
-            width, height = 1920, 1080
-            if "x" in TRANSCODE_RESOLUTION:
-                try:
-                    w_str, h_str = TRANSCODE_RESOLUTION.lower().split("x", 1)
-                    width, height = int(w_str), int(h_str)
-                except ValueError:
-                    pass
-
-            # Build ffmpeg filters: denoise -> scale -> sharpen
-            # hqdn3d removes digital compression blockiness before scaling/sharpening
-            vf_filters = []
-            if TRANSCODE_DENOISE > 0.0:
-                # scale parameters relative to TRANSCODE_DENOISE strength
-                luma_sp = TRANSCODE_DENOISE * 1.5
-                chroma_sp = TRANSCODE_DENOISE * 1.5
-                luma_tmp = TRANSCODE_DENOISE * 3.0
-                chroma_tmp = TRANSCODE_DENOISE * 3.0
-                vf_filters.append(f"hqdn3d={luma_sp}:{chroma_sp}:{luma_tmp}:{chroma_tmp}")
+        if FFMPEG_FOUND:
+            # Build ffmpeg command using custom headers to bypass hotlink checks
+            headers_str = "".join(f"{k}: {v}\r\n" for k, v in stream_headers.items())
             
-            vf_filters.append(f"scale={width}:{height}:flags=lanczos")
-            
-            if TRANSCODE_SHARPEN > 0.0:
-                vf_filters.append(f"unsharp=5:5:{TRANSCODE_SHARPEN}:5:5:0.0")
-
-            vf = ",".join(vf_filters)
-
-            # Execute ffmpeg reading the HLS manifest directly and outputting MPEG-TS to stdout
             cmd = [
                 "ffmpeg",
-                "-re",                              # Read input at native frame rate
-                "-i", m3u8_url,                     # Input HLS stream
-                "-vf", vf,                          # Video filters (scale + sharpen)
-                "-c:v", "libx264",                  # Encode video to H.264
-                "-preset", "ultrafast",             # Minimize CPU load (crucial for NAS)
-                "-tune", "zerolatency",             # Keep latency as low as possible
-                "-c:a", "copy",                     # Copy audio stream losslessly
-                "-f", "mpegts",                     # Output container format
-                "pipe:1"                            # Output to stdout
+                "-headers", headers_str,
+                "-re",
+                "-i", m3u8_url
             ]
-
-            print(f"Launching ffmpeg upscaler: {' '.join(cmd)}", flush=True)
+            
+            if TRANSCODE_UPSCALING:
+                # Parse target resolution dimensions
+                width, height = 1920, 1080
+                if "x" in TRANSCODE_RESOLUTION:
+                    try:
+                        w_str, h_str = TRANSCODE_RESOLUTION.lower().split("x", 1)
+                        width, height = int(w_str), int(h_str)
+                    except ValueError:
+                        pass
+                
+                # Build filters: denoise -> scale -> sharpen
+                vf_filters = []
+                if TRANSCODE_DENOISE > 0.0:
+                    luma_sp = TRANSCODE_DENOISE * 1.5
+                    chroma_sp = TRANSCODE_DENOISE * 1.5
+                    luma_tmp = TRANSCODE_DENOISE * 3.0
+                    chroma_tmp = TRANSCODE_DENOISE * 3.0
+                    vf_filters.append(f"hqdn3d={luma_sp}:{chroma_sp}:{luma_tmp}:{chroma_tmp}")
+                
+                vf_filters.append(f"scale={width}:{height}:flags=lanczos")
+                
+                if TRANSCODE_SHARPEN > 0.0:
+                    vf_filters.append(f"unsharp=5:5:{TRANSCODE_SHARPEN}:5:5:0.0")
+                
+                cmd.extend([
+                    "-vf", ",".join(vf_filters),
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-tune", "zerolatency"
+                ])
+            else:
+                # Copy video stream losslessly (zero CPU usage)
+                cmd.extend([
+                    "-c:v", "copy"
+                ])
+                
+            # Transcode audio to standard AAC stereo to ensure 100% Plex/client audio compatibility
+            cmd.extend([
+                "-c:a", "aac",
+                "-ac", "2",
+                "-f", "mpegts",
+                "pipe:1"
+            ])
+            
+            print(f"Launching ffmpeg remuxer/upscaler: {' '.join(cmd)}", flush=True)
             try:
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             except Exception as e:
-                print(f"Error launching ffmpeg upscaler: {e}", flush=True)
-                self.send_error(HTTPStatus.BAD_GATEWAY, f"Failed to launch ffmpeg upscaler: {e}")
+                print(f"Error launching ffmpeg remuxer: {e}", flush=True)
+                self.send_error(HTTPStatus.BAD_GATEWAY, f"Failed to launch ffmpeg remuxer: {e}")
                 return
-
+                
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "video/mp2t")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Connection", "keep-alive")
             self.end_headers()
-
+            
             try:
                 while True:
                     chunk = proc.stdout.read(64 * 1024)
@@ -872,12 +912,13 @@ class TunerHandler(BaseHTTPRequestHandler):
                         break
                     self.wfile.write(chunk)
             except (BrokenPipeError, ConnectionResetError):
-                print("Client disconnected from upscaled TS stream", flush=True)
+                print("Client disconnected from remuxed TS stream", flush=True)
             finally:
                 proc.terminate()
                 proc.wait()
             return
 
+        # Fallback Python segment downloader loop (only used if ffmpeg is missing)
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "video/mp2t")
         self.send_header("Cache-Control", "no-store")
@@ -888,13 +929,13 @@ class TunerHandler(BaseHTTPRequestHandler):
 
         while True:
             # Fetch the playlist
-            req = Request(m3u8_url, headers={"User-Agent": "IPTV-Tuner/1.0", "Accept": "*/*"})
+            req = Request(m3u8_url, headers=stream_headers)
             try:
                 with urlopen(req, timeout=10) as resp:
                     playlist_content = resp.read().decode("utf-8", errors="ignore")
                     playlist_url = resp.url
             except Exception as e:
-                print(f"Error fetching playlist in TS streamer: {e}", flush=True)
+                print(f"Error fetching HLS playlist in fallback loop: {e}", flush=True)
                 time.sleep(2)
                 continue
 
@@ -915,8 +956,8 @@ class TunerHandler(BaseHTTPRequestHandler):
             # Send new segments
             new_segments = [s for s in segments if s not in sent_segments]
             for seg_url in new_segments:
-                print(f"Streaming TS segment to client: {seg_url}", flush=True)
-                seg_req = Request(seg_url, headers={"User-Agent": "IPTV-Tuner/1.0", "Accept": "*/*"})
+                print(f"Streaming HLS segment to client (fallback): {seg_url}", flush=True)
+                seg_req = Request(seg_url, headers=stream_headers)
                 try:
                     with urlopen(seg_req, timeout=15) as seg_resp:
                         while chunk := seg_resp.read(64 * 1024):
@@ -935,8 +976,8 @@ class TunerHandler(BaseHTTPRequestHandler):
             # Sleep for half of target duration (e.g. 3s)
             time.sleep(max(1.0, target_duration / 2.0))
 
-    def proxy(self, target: str, base: str) -> None:
-        request = Request(target, headers={"User-Agent": "IPTV-Tuner/1.0", "Accept": "*/*"})
+    def proxy(self, target: str, base: str, stream_headers: dict[str, str]) -> None:
+        request = Request(target, headers=stream_headers)
         try:
             with urlopen(request, timeout=20) as response:
                 content_type = response.headers.get_content_type()
@@ -954,7 +995,7 @@ class TunerHandler(BaseHTTPRequestHandler):
                         if video_url:
                             if "/proxy?url=" in video_url:
                                 video_url = unquote(video_url.split("/proxy?url=", 1)[1])
-                            self.proxy(video_url, base)
+                            self.proxy(video_url, base, stream_headers)
                             return
                     body = rewrite_manifest(body_bytes, response.url, base)
                     self.send_text(body, "application/vnd.apple.mpegurl")
@@ -975,13 +1016,10 @@ class TunerHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.BAD_GATEWAY, f"Upstream stream error: {error}")
 
 
-import shutil
-
 if __name__ == "__main__":
     # Check if ffmpeg is available on startup to help users debug container updates
-    ffmpeg_found = shutil.which("ffmpeg") is not None
-    if ffmpeg_found:
-        print("INFO: 'ffmpeg' found on system path. ScrapeTuner is ready for real-time video upscaling.", flush=True)
+    if FFMPEG_FOUND:
+        print("INFO: 'ffmpeg' found on system path. ScrapeTuner is ready for real-time video upscaling and audio transcoding.", flush=True)
     else:
         if TRANSCODE_UPSCALING:
             print("WARNING: TRANSCODE_UPSCALING is set to True, but 'ffmpeg' was NOT found on the system path! Upscaling will fail.", flush=True)
