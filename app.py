@@ -151,17 +151,25 @@ EPG_NAME_MAP = {
 
 EPG_ID_MAP = {
     "rtl": "RTL.de",
+    "rtlt": "RTL.de",
     "rtl2": "RTLZwei.de",
+    "rtl-2": "RTLZwei.de",
+    "rtlzwei": "RTLZwei.de",
+    "rtl-zwei": "RTLZwei.de",
     "vox": "Vox.de",
+    "voxt": "Vox.de",
     "n-tv": "n-tv.de",
     "ntv": "n-tv.de",
     "rtl-nitro": "RTLNitro.de",
     "rtlnitro": "RTLNitro.de",
+    "nitro": "RTLNitro.de",
     "superrtl": "SuperRTL.de",
     "super-rtl": "SuperRTL.de",
     "pro7": "ProSieben.de",
     "pro-7": "ProSieben.de",
+    "prosieben": "ProSieben.de",
     "kabel1": "KabelEins.de",
+    "kabel-1": "KabelEins.de",
     "kabel-eins": "KabelEins.de",
     "sat1": "Sat1.de",
     "sat-1": "Sat1.de",
@@ -170,20 +178,26 @@ EPG_ID_MAP = {
     "sky-sport-news": "SkySportNews.de",
     "sport1": "Sport1.de",
     "prosieben-maxx": "ProSiebenMaxx.de",
+    "prosiebenmaxx": "ProSiebenMaxx.de",
     "kabeleins-doku": "KabelEinsDoku.de",
     "kabel-1-doku": "KabelEinsDoku.de",
+    "kabel-eins-doku": "KabelEinsDoku.de",
     "tlc": "TLC.de",
     "sat1gold": "Sat1Gold.de",
     "sat-1-gold": "Sat1Gold.de",
+    "sat1-gold": "Sat1Gold.de",
     "tele5": "Tele5.de",
     "tele-5": "Tele5.de",
     "comedy-central": "ComedyCentralGermany.de",
+    "comedycentral": "ComedyCentralGermany.de",
     "welt": "Welt.de",
     "zdfneo": "ZDFneo.de",
     "zdf-neo": "ZDFneo.de",
     "disney-channel": "DisneyChannel.de",
+    "disney": "DisneyChannel.de",
     "ard": "DasErste.de",
     "das-erste": "DasErste.de",
+    "daserste": "DasErste.de",
     "zdf": "ZDF.de",
     "zdfinfo": "ZDFinfo.de",
     "zdf-info": "ZDFinfo.de",
@@ -191,6 +205,7 @@ EPG_ID_MAP = {
     "3sat": "3sat.de",
     "arte": "Arte.de",
     "tagesschau24": "Tagesschau24.de",
+    "tagesschau": "Tagesschau24.de",
     "mdr": "MDRSachsen.de",
     "wdr": "WDRKoeln.de",
     "br": "BRFernsehenSued.de",
@@ -203,7 +218,11 @@ EPG_ID_MAP = {
     "swr": "SWRFernsehenBW.de",
     "sr": "SRFernsehen.de",
     "servustv": "ServusTVDeutschland.de",
-    "serv-tv": "ServusTVDeutschland.de"
+    "serv-tv": "ServusTVDeutschland.de",
+    "deluxemusic": "DeluxeMusic.de",
+    "deluxe-music": "DeluxeMusic.de",
+    "nickelodeon": "Nickelodeon.de",
+    "nick": "Nickelodeon.de"
 }
 
 
@@ -552,8 +571,8 @@ def parse_playlist() -> list[Channel]:
         print(f"INFO: Scraper provider '{provider}' returned {len(scraped)} channels.", flush=True)
         
         for ch in scraped:
-            # Match channels case-insensitively by name
-            match_key = ch.name.lower().strip()
+            # Match channels case-insensitively by EPG TVG ID
+            match_key = ch.tvg_id.lower().strip()
             if match_key not in channels_by_key:
                 channels_by_key[match_key] = ch
                 ordered_keys.append(match_key)
