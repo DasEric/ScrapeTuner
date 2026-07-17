@@ -18,9 +18,7 @@
 
 ## Quick Start (Docker Compose)
 
-The easiest way to run ScrapeTuner is using Docker Compose. 
-
-The pre-built Docker image is available on Docker Hub: [DasEric/ScrapeTuner](https://hub.docker.com/r/DasEric/ScrapeTuner).
+The easiest way to run ScrapeTuner is using Docker Compose. The pre-built Docker image is available on Docker Hub: [DasEric/ScrapeTuner](https://hub.docker.com/r/DasEric/ScrapeTuner).
 
 1. Create a `compose.yaml` file:
    ```yaml
@@ -41,6 +39,8 @@ The pre-built Docker image is available on Docker Hub: [DasEric/ScrapeTuner](htt
          - TRANSCODE_RESOLUTION=1920x1080
          - TRANSCODE_SHARPEN=0.5
          - TRANSCODE_DENOISE=1.0
+         # Scraper Fallback Priority List (comma-separated list of: 2ix2tv, livedetv, lolmt2, 2ix2)
+         - SCRAPER_PROVIDERS=2ix2tv,livedetv,lolmt2,2ix2
        restart: unless-stopped
    ```
 2. Start the container:
@@ -49,9 +49,15 @@ The pre-built Docker image is available on Docker Hub: [DasEric/ScrapeTuner](htt
    ```
    *(Note: You can still build it locally using `build: .` in your compose file and running `docker compose up -d --build` if you prefer).*
 
+### Scraper Priority & Fallback Failover System
+ScrapeTuner automatically aggregates channels and failover urls from multiple TV portal backends. If a stream fails (e.g. gets blocked by Cloudflare challenge on one provider), it immediately falls back to the next working stream provider.
+* **`SCRAPER_PROVIDERS`**: Comma-separated list (or JSON array in `config.json`) defining the fallback priority order. Default is `2ix2tv,livedetv,lolmt2,2ix2`.
+  * **`2ix2tv.de` / `nydus.org` / `lolmt2.com`**: Offers pristine official direct CDN streams for all German public channels (ARD, ZDF, 3sat, Arte, regional channels, etc.) as well as TLC and Disney Channel.
+  * **`livedetv.com`**: Resolves direct tokenized HLS streams from `helpfullive.info` for private channels (RTL, ProSieben, VOX, RTL2, etc.) bypassing Cloudflare Turnstile blocks automatically.
+
 ### Optional Real-Time Video Upscaling & Sharpening (Experimental)
 > [!IMPORTANT]
-> **This feature is experimental.** Transcoding live streams in real-time is extremely resource-intensive. Depending on your CPU performance and stream conditions, **it can lead to errors, stream stuttering, buffering, or high CPU spikes.**
+> **This feature is experimental.** Transcoding live streams in real-time is extremely resource-intensive. Depending on your NAS CPU performance and stream conditions, **it can lead to errors, stream stuttering, buffering, or high CPU spikes.**
 
 If you enable `TRANSCODE_UPSCALING=true`, ScrapeTuner will route HLS video frames through `ffmpeg` inside the container:
 * **`TRANSCODE_UPSCALING`**: Enable (`true`) or disable (`false`, default) the real-time transcoding pipeline.
@@ -94,14 +100,14 @@ If you enable `TRANSCODE_UPSCALING=true`, ScrapeTuner will route HLS video frame
 
 If you prefer to define a custom playlist instead of scraping all channels, you can place a `channels.m3u` file inside the `./config` directory. 
 
-You can mix direct HLS URLs and `2ix2.com` web pages:
+You can mix direct HLS URLs and `2ix2tv.de` or `livedetv.com` web pages:
 ```m3u
 #EXTM3U
 #EXTINF:-1 tvg-id="RTL.de" tvg-chno="10001" group-title="TV",RTL
-https://www.2ix2.com/rtl-live/
+https://www.livedetv.com/rtl-live/
 
 #EXTINF:-1 tvg-id="ProSieben.de" tvg-chno="10007" group-title="TV",ProSieben
-https://www.2ix2.com/pro-7/
+https://2ix2tv.de/prosieben
 
 #EXTINF:-1 tvg-id="custom-stream" tvg-chno="10056" group-title="TV",My Local Stream
 https://stream.example.org/live/master.m3u8
@@ -122,7 +128,13 @@ To make configuration on NAS systems as easy as possible, ScrapeTuner supports l
      "TRANSCODE_UPSCALING": false,
      "TRANSCODE_RESOLUTION": "1920x1080",
      "TRANSCODE_SHARPEN": 0.5,
-     "TRANSCODE_DENOISE": 1.0
+     "TRANSCODE_DENOISE": 1.0,
+     "SCRAPER_PROVIDERS": [
+       "2ix2tv",
+       "livedetv",
+       "lolmt2",
+       "2ix2"
+     ]
    }
    ```
 3. **No Docker Settings Needed:** Changing values inside this file and restarting the container will apply your settings immediately. You do not need to configure environment variables in your NAS Docker GUI.
