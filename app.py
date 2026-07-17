@@ -226,6 +226,16 @@ EPG_ID_MAP = {
 }
 
 
+def normalize_slug(slug: str) -> str:
+    cleaned = slug.lower().strip()
+    # Strip common suffixes/prefixes
+    cleaned = re.sub(r'-(?:live|livestream|stream|tv|fernsehen|de)$', '', cleaned)
+    cleaned = re.sub(r'^(?:live|stream)-', '', cleaned)
+    # Remove all non-alphanumeric characters
+    cleaned = re.sub(r'[^a-z0-9]', '', cleaned)
+    return cleaned
+
+
 def lookup_name(parsed_name: str) -> str:
     parsed_clean = parsed_name.strip()
     for k, v in EPG_NAME_MAP.items():
@@ -235,13 +245,12 @@ def lookup_name(parsed_name: str) -> str:
 
 
 def lookup_epg_id(slug: str) -> str:
-    slug_lower = slug.lower()
-    if slug_lower in EPG_ID_MAP:
-        return EPG_ID_MAP[slug_lower]
+    norm = normalize_slug(slug)
+    # Search normalized keys in EPG_ID_MAP
     for k, v in EPG_ID_MAP.items():
-        if k.lower() == slug_lower:
+        if normalize_slug(k) == norm:
             return v
-    return f"iptv-{slug_lower}"
+    return f"iptv-{norm}"
 
 
 # Global Cache for Scraped Playlists
@@ -375,9 +384,7 @@ def get_livedetv_channels() -> list[Channel]:
         seen_slugs.add(slug_lower)
         
         name_clean = lookup_name(html.unescape(name))
-        # Map livedetv specific slugs like rtl-live to standard EPG IDs
-        epg_slug = slug_lower.replace("-live", "").replace("-livestream", "")
-        tvg = lookup_epg_id(epg_slug)
+        tvg = lookup_epg_id(slug_lower)
         
         ch = Channel(
             number="",

@@ -1,14 +1,7 @@
 {
-  "PORT": 5004,
+  "PORT": 5006,
   "PUBLIC_BASE_URL": "",
   "TRANSCODE_UPSCALING": false,
   "TRANSCODE_RESOLUTION": "1920x1080",
-  "TRANSCODE_SHARPEN": 0.5,
-  "TRANSCODE_DENOISE": 1.0,
-  "SCRAPER_PROVIDERS": [
-    "2ix2tv",
-    "livedetv",
-    "lolmt2",
-    "2ix2"
-  ]
+  "TRANSCODE_SHARPEN": 0.5
 }
