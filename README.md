@@ -1,6 +1,6 @@
 # ScrapeTuner: Dynamic Live TV Proxy for Plex & Jellyfin
 
-**ScrapeTuner** is a lightweight IPTV facade and scraper proxy that emulates a SiliconDust HDHomeRun network tuner. It dynamically scrapes free live TV streams from sources like `2ix2.com` on-the-fly, remuxes them into a continuous MPEG-TS stream, and maps them to standard German EPG (Electronic Program Guide) channels.
+**ScrapeTuner** is a lightweight IPTV facade and scraper proxy that emulates a SiliconDust HDHomeRun network tuner. It discovers live TV channels across multiple sources, remuxes HLS into a continuous MPEG-TS stream, and maps channels to standard German EPG (Electronic Program Guide) IDs.
 
 *Note: ScrapeTuner is designed to easily expand. Support for more free live TV streaming platforms and websites will be added in future updates!*
 
@@ -50,10 +50,11 @@ The easiest way to run ScrapeTuner is using Docker Compose. The pre-built Docker
    *(Note: You can still build it locally using `build: .` in your compose file and running `docker compose up -d --build` if you prefer).*
 
 ### Scraper Priority & Fallback Failover System
-ScrapeTuner automatically aggregates channels and failover urls from multiple TV portal backends. If a stream fails (e.g. gets blocked by Cloudflare challenge on one provider), it immediately falls back to the next working stream provider.
-* **`SCRAPER_PROVIDERS`**: Comma-separated list (or JSON array in `config.json`) defining the fallback priority order. Default is `2ix2tv,livedetv,lolmt2,2ix2`.
-  * **`2ix2tv.de` / `nydus.org` / `lolmt2.com`**: Offers pristine official direct CDN streams for all German public channels (ARD, ZDF, 3sat, Arte, regional channels, etc.) as well as TLC and Disney Channel.
-  * **`livedetv.com`**: Resolves direct tokenized HLS streams from `helpfullive.info` for private channels (RTL, ProSieben, VOX, RTL2, etc.) bypassing Cloudflare Turnstile blocks automatically.
+In auto-discovery mode, ScrapeTuner reads each provider's own channel listing and merges matching EPG IDs. Two sites can still use the same upstream player, so seeing both sites in a channel's lineup does not guarantee independent streams.
+
+* **`SCRAPER_PROVIDERS`** sets the order in which sources are tried. The default is `2ix2tv,livedetv,lolmt2,2ix2`, with legacy `2ix2.com` tried last. Use `2ix2tv,livedetv,lolmt2` to disable the legacy source entirely. A value in `config.json` takes precedence over the environment variable; restart the tuner after changing it.
+* A successful HTTP status is not enough: a source must return a playable HLS playlist or MPEG-TS data. An HTML player/error page, an invalid manifest, or a remuxer that produces no initial data triggers the next candidate. The tuner logs the provider that starts playback. If all candidates fail, it returns HTTP 502. Once playback has started, the tuner does not switch sources within that connection.
+* Auto-discovery is used only when there is no custom `channels.m3u`. A custom playlist uses the URLs you provide, without auto-discovery failover.
 
 ### Optional Real-Time Video Upscaling & Sharpening (Experimental)
 > [!IMPORTANT]

@@ -2,21 +2,25 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import html
+import http.cookiejar
 import json
 import mimetypes
 import os
 import re
-import socket
+import shutil
 import subprocess
 import time
-import base64
 from dataclasses import dataclass, field
-import http.cookiejar
 from http import HTTPStatus
+from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from html.parser import HTMLParser
 from pathlib import Path
-from typing import Iterable
+from queue import Empty, Queue
+from threading import Thread
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urljoin, urlparse
 from urllib.request import Request, urlopen, HTTPCookieProcessor, build_opener
@@ -85,10 +89,37 @@ TRANSCODE_UPSCALING = config_data["TRANSCODE_UPSCALING"]
 TRANSCODE_RESOLUTION = config_data["TRANSCODE_RESOLUTION"]
 TRANSCODE_SHARPEN = config_data["TRANSCODE_SHARPEN"]
 TRANSCODE_DENOISE = config_data["TRANSCODE_DENOISE"]
-SCRAPER_PROVIDERS = config_data["SCRAPER_PROVIDERS"]
-
-import shutil
 FFMPEG_FOUND = shutil.which("ffmpeg") is not None
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+UPSTREAM_ERRORS = (OSError, ValueError, HTTPException)
+
+PROVIDER_HOME = {
+    "2ix2tv": "https://2ix2tv.de/",
+    "livedetv": "https://www.livedetv.com/",
+    "lolmt2": "https://lolmt2.com/",
+    "nydus": "https://nydus.org/stream/",
+    "raidrush": "https://raidrush.net/stream/",
+    "2ix2": "https://www.2ix2.com/",
+}
+PROVIDER_ALIASES = {
+    urlparse(url).hostname.removeprefix("www."): key for key, url in PROVIDER_HOME.items()
+}
+TILE_PROVIDERS = {"2ix2tv", "lolmt2", "nydus", "raidrush"}
+
+
+def normalize_providers(values: list[str]) -> list[str]:
+    providers = []
+    for value in values:
+        key = value.strip().lower().removeprefix("www.")
+        key = PROVIDER_ALIASES.get(key, key)
+        if key not in PROVIDER_HOME:
+            print(f"WARNING: Unknown scraper provider '{value}' configured. Skipping.", flush=True)
+        elif key not in providers:
+            providers.append(key)
+    return providers
+
+
+SCRAPER_PROVIDERS = normalize_providers(config_data["SCRAPER_PROVIDERS"])
 
 
 @dataclass
@@ -240,15 +271,10 @@ def normalize_slug(slug: str) -> str:
 
 
 def get_provider_headers(provider: str) -> dict[str, str]:
-    prov = provider.lower().strip()
-    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    if prov in ("livedetv", "livedetv.com"):
-        return {"User-Agent": ua, "Referer": "https://www.livedetv.com/"}
-    elif prov in ("2ix2tv", "nydus", "lolmt2", "raidrush"):
-        return {"User-Agent": ua, "Referer": "https://2ix2tv.de/"}
-    elif prov in ("2ix2", "2ix2.com"):
-        return {"User-Agent": ua, "Referer": "https://www.2ix2.com/"}
-    return {"User-Agent": ua, "Accept": "*/*"}
+    headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
+    if provider in PROVIDER_HOME:
+        headers["Referer"] = PROVIDER_HOME[provider]
+    return headers
 
 
 def lookup_name(parsed_name: str) -> str:
@@ -273,277 +299,225 @@ _aggregated_channels_cache: list[Channel] = []
 _last_scraped_time: float = 0.0
 
 
-# 1. 2ix2tv / nydus / lolmt2 Scraper
-def get_2ix2tv_channels(host_url: str = "https://2ix2tv.de/") -> list[Channel]:
-    req = Request(
-        host_url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-    )
+class ProviderMarkup(HTMLParser):
+    """Read the small part of the markup used by channel cards and players."""
+
+    def __init__(self, page: str):
+        super().__init__(convert_charrefs=True)
+        self.tiles = []
+        self.cards = []
+        self.frames = []
+        self.media = []
+        self.tile = None
+        self.anchor = None
+        self.in_channel_name = False
+        self.feed(page)
+
+    def handle_starttag(self, tag, attributes):
+        attrs = dict(attributes)
+        classes = (attrs.get("class") or "").split()
+        if "tvsender" in classes:
+            click = re.fullmatch(r"""\s*showPlayerHQ\(\s*(['"])([a-zA-Z0-9_-]+)\1\s*\)\s*;?\s*""",
+                                 attrs.get("onclick") or "")
+            self.tile = click[2] if click else None
+        if tag == "a":
+            self.anchor = [attrs.get("href") or "", "", "", ""]
+            self.in_channel_name = False
+        elif tag == "span" and "colorchannel" in classes:
+            self.in_channel_name = True
+        elif tag == "img":
+            logo = attrs.get("data-src") or attrs.get("src") or ""
+            name = attrs.get("alt") or ""
+            if self.tile:
+                self.tiles.append((self.tile, logo, name or self.tile))
+                self.tile = None
+            if self.anchor and not self.anchor[1]:
+                self.anchor[1:3] = logo, name
+        elif tag == "iframe" and attrs.get("src"):
+            self.frames.append(attrs["src"])
+        elif tag in ("source", "video") and attrs.get("src"):
+            self.media.append(attrs["src"])
+
+    def handle_data(self, data):
+        if self.anchor and self.in_channel_name:
+            self.anchor[3] += data
+
+    def handle_endtag(self, tag):
+        if tag == "span":
+            self.in_channel_name = False
+        elif tag == "div":
+            self.tile = None
+        elif tag == "a" and self.anchor:
+            self.cards.append(self.anchor)
+            self.anchor = None
+            self.in_channel_name = False
+
+
+def fetch_page(url: str, headers: dict[str, str], open_url=None) -> tuple[str, str]:
+    if open_url is None:
+        open_url = urlopen
+    with open_url(Request(url, headers=headers), timeout=7) as response:
+        body = response.read(2 * 1024 * 1024 + 1)
+        if len(body) > 2 * 1024 * 1024:
+            raise ValueError("page exceeds size limit")
+        return response.url, body.decode("utf-8", errors="replace")
+
+
+def http_url(base: str, value: str) -> str:
+    value = value.strip()
+    if not value or value.startswith(("#", "[", "<")):
+        return ""
+    url = urljoin(base, value)
+    parsed = urlparse(url)
+    return url if parsed.scheme in ("http", "https") and parsed.hostname else ""
+
+
+def provider_for_url(url: str) -> str:
     try:
-        with urlopen(req, timeout=12) as response:
-            content = response.read().decode("utf-8", errors="ignore")
-    except Exception as e:
-        print(f"WARNING: Error scraping {host_url}: {e}", flush=True)
-        return []
+        hostname = urlparse(url).hostname or ""
+    except ValueError:
+        return ""
+    return PROVIDER_ALIASES.get(hostname.removeprefix("www."), "")
 
-    # class="tvsender" onclick="showPlayerHQ('xxx');"><img src="logo" alt="name"
-    matches = re.finditer(
-        r'class="tvsender"\s+onclick="showPlayerHQ\(\'([^\'\s]+)\'\);"[^>]*>.*?src="([^"]+)"\s+alt="([^"]+)"',
-        content,
-        re.DOTALL | re.IGNORECASE
+
+def tile_player(page: str, base: str, slug: str) -> str:
+    """Use the literal iframe target advertised by this listing, not a mirror's."""
+    special = re.search(
+        r"""\bif\s*\(\s*id\s*={2,3}\s*['"]""" + re.escape(slug) +
+        r"""['"]\s*\)\s*\{\s*player\.src\s*=\s*(['"])(.*?)\1""", page
     )
+    if special:
+        return http_url(base, special[2])
+    template = re.search(
+        r"""\bplayer\.src\s*=\s*(['"])([^'"]+)\1\s*\+\s*id\b(?:\s*\+\s*(['"])([^'"]*)\3)?""",
+        page,
+    )
+    return http_url(base, template[2] + quote(slug, safe="") + (template[4] or "")) if template else ""
 
-    channels: list[Channel] = []
-    seen_slugs = set()
-    for m in matches:
-        slug, logo, name = m.groups()
-        slug_lower = slug.lower()
-        if slug_lower in seen_slugs:
-            continue
-        seen_slugs.add(slug_lower)
-        
-        name_clean = lookup_name(html.unescape(name))
-        tvg = lookup_epg_id(slug_lower)
-        if logo.startswith("//"):
-            logo = "https:" + logo
-        elif logo.startswith("/"):
-            logo = "https://nydus.org" + logo
-            
-        ch = Channel(
-            number="",
-            name=name_clean,
-            url=f"https://2ix2tv.de/{slug_lower}",
-            tvg_id=tvg,
-            logo=logo
+
+def discover_provider(provider: str) -> list[Channel]:
+    base, page = fetch_page(PROVIDER_HOME[provider], get_provider_headers(provider))
+    markup = ProviderMarkup(page)
+    entries = []
+    if provider in TILE_PROVIDERS:
+        for slug, logo, name in markup.tiles:
+            player = tile_player(page, base, slug)
+            if player:
+                entries.append((slug, logo, name, player))
+    else:
+        for href, logo, alt, title in markup.cards:
+            target = http_url(base, href)
+            if not target or provider_for_url(target) != provider:
+                continue
+            slug = urlparse(target).path.strip("/")
+            if not re.fullmatch(r"[a-zA-Z0-9_-]+", slug):
+                continue
+            name = title.strip() if provider == "livedetv" else alt
+            if name and logo:
+                entries.append((slug, logo, name, target))
+
+    channels = {}
+    for slug, logo, name, target in entries:
+        tvg_id = lookup_epg_id(slug)
+        channels.setdefault(tvg_id.lower(), Channel(
+            "", lookup_name(name), target, tvg_id, http_url(base, logo), {provider: target},
+        ))
+    return list(channels.values())
+
+
+PLAYER_SOURCE = re.compile(r"""\b(?:file|source)\s*:\s*(['"])([^'"]+)\1""", re.I)
+HLS_LITERAL = re.compile(r"""((?:https?://|//|/|\.\.?/)[^\s"'<>]+?\.m3u8(?:[?#][^\s"'<>]*)?)""", re.I)
+
+
+def advertised_media(page: str, markup: ProviderMarkup, base: str, *, hls_literals=False) -> str:
+    player = page.replace(r"\/", "/").replace("&amp;", "&")
+    sources = [*markup.media, *(m[2] for m in PLAYER_SOURCE.finditer(player))]
+    if hls_literals:
+        sources.extend(HLS_LITERAL.findall(player))
+    return next((url for source in sources if (url := http_url(base, source))), "")
+
+
+def resolve_tile_stream(player_url: str, headers: dict[str, str]) -> str:
+    base, page = fetch_page(player_url, headers)
+    markup = ProviderMarkup(page)
+    if source := advertised_media(page, markup, base):
+        return source
+
+    # Older and current players can wrap a literal source in base64. Read the
+    # data only; do not execute the player's JavaScript or navigate gated frames.
+    packed = re.search(r"""\b(?:var|let|const)\s+zdec\s*=\s*(['"])([A-Za-z0-9+/=]+)\1""", page)
+    if not packed:
+        return ""
+    try:
+        decoded = base64.b64decode(packed[2], validate=True).decode("utf-8")
+        player = re.search(
+            r"""\bdrawIFR2?\s*\(\s*(?:(['"])([^'"]+)\1|atob\(\s*(['"])([^'"]+)\3\s*\))""",
+            decoded,
         )
-        ch.provider_urls["2ix2tv"] = f"https://2ix2tv.de/{slug_lower}"
-        ch.provider_urls["lolmt2"] = f"https://lolmt2.com/{slug_lower}"
-        ch.provider_urls["nydus"] = f"https://lolmt2.com/{slug_lower}"
-        ch.provider_urls["raidrush"] = f"https://lolmt2.com/{slug_lower}"
-        channels.append(ch)
-        
-    return channels
+        if player:
+            value = player[2] or base64.b64decode(player[4], validate=True).decode("utf-8")
+            target = http_url(base, value)
+            parsed = urlparse(target)
+            if target and parsed.path.lower().endswith(".m3u8"):
+                return target
+            if (parsed.hostname or "").endswith(".hopslan.com") and parsed.path.endswith("/embed.html"):
+                # This Flussonic player serves HLS in the same stream directory.
+                return parsed._replace(path=parsed.path.removesuffix("embed.html") + "index.m3u8", fragment="").geturl()
+    except (binascii.Error, UnicodeError):
+        pass
+    return ""
 
 
-def resolve_2ix2tv_stream(slug: str) -> str:
-    url = f"https://nydus.org/stream/embedplayer_hq.php?id={slug}&ewr=1"
-    req = Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Referer": "https://2ix2tv.de/"
-        }
-    )
-    try:
-        with urlopen(req, timeout=10) as response:
-            content = response.read().decode("utf-8", errors="ignore")
-            match = re.search(r'function initClappr\(\)\{\s*var zdec\s*=\s*["\']([^"\']+)["\']', content)
-            if not match:
-                print(f"WARNING: initClappr base64 not found for {slug} on nydus.org", flush=True)
+def resolve_livedetv_stream(channel_url: str, headers: dict[str, str]) -> str:
+    opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    pending = [(channel_url, headers["Referer"])]
+    seen = set()
+    # Follow actual same-site player frames, including the direct /yayin/ frame
+    # on channel pages. The site's /embed/ wrapper is just another entry point.
+    while pending and len(seen) < 6:
+        url, referer = pending.pop(0)
+        if url in seen:
+            continue
+        seen.add(url)
+        try:
+            base, page = fetch_page(url, {**headers, "Referer": referer}, opener.open)
+        except UPSTREAM_ERRORS:
+            continue
+        if provider_for_url(base) != "livedetv":
+            continue
+        markup = ProviderMarkup(page)
+        if source := advertised_media(page, markup, base, hls_literals=urlparse(base).path == "/token.php"):
+            return source
+        frames = []
+        for frame in markup.frames:
+            target = http_url(base, frame)
+            if provider_for_url(target) != "livedetv":
+                continue
+            path = urlparse(target).path
+            if path.startswith(("/embed/", "/yayin/")) or path == "/token.php":
+                frames.append((target, base))
+        pending[0:0] = frames
+    return ""
+
+
+def resolve_candidate(provider: str, url: str, headers: dict[str, str], *, custom=False) -> str:
+    # M3U entries can be direct streams or supported public player pages.
+    if custom and urlparse(url).path.lower().endswith((".m3u8", ".ts")):
+        return url
+    if provider in TILE_PROVIDERS:
+        if custom:
+            slug = urlparse(url).path.strip("/")
+            if not re.fullmatch(r"[a-zA-Z0-9_-]+", slug):
                 return ""
-                
-            zdec = match.group(1)
-            zdec_decoded = base64.b64decode(zdec).decode('utf-8', errors='ignore')
-            inner_b64 = re.search(r"atob\(['\"]([^'\"]+)['\"]\)", zdec_decoded)
-            if inner_b64:
-                embed_url = base64.b64decode(inner_b64.group(1)).decode('utf-8', errors='ignore')
-                
-                # Auto-rewrite Flussonic hopslan embed URLs to direct index.m3u8 playlists
-                if "hopslan.com" in embed_url and "embed.html" in embed_url:
-                    hop_match = re.search(r'https?://([^/]+)/([^/]+)/embed\.html', embed_url)
-                    if hop_match:
-                        host, stream_name = hop_match.groups()
-                        return f"https://{host}/{stream_name}/index.m3u8"
-                return embed_url
-            else:
-                direct_url = re.search(r'drawIFR2\([\'"]([^\'"]+)[\'"]\)', zdec_decoded)
-                if direct_url:
-                    return direct_url.group(1)
-    except Exception as e:
-        print(f"Error resolving 2ix2tv stream for slug '{slug}': {e}", flush=True)
-    return ""
-
-
-# 2. livedetv Scraper & Session Cookie Resolver
-def get_livedetv_channels() -> list[Channel]:
-    host_url = "https://livedetv.com/"
-    req = Request(
-        host_url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-    )
-    try:
-        with urlopen(req, timeout=12) as response:
-            content = response.read().decode("utf-8", errors="ignore")
-    except Exception as e:
-        print(f"WARNING: Error scraping {host_url}: {e}", flush=True)
-        return []
-
-    # Parse channel link cards
-    matches = re.finditer(
-        r'<a href="(https?://(?:www\.)?livedetv\.com/([^"/]+)/?)"[^>]*>.*?<img[^>]+src="([^"]+)"[^>]*>.*?<span class="colorchannel">([^<]+)</span>',
-        content,
-        re.DOTALL | re.IGNORECASE
-    )
-
-    channels: list[Channel] = []
-    seen_slugs = set()
-    for m in matches:
-        href, slug, logo, name = m.groups()
-        slug_lower = slug.lower()
-        if slug_lower in seen_slugs or slug_lower in ("sayfa", "kategori", "giris", "kayit", "kanallistesi", "ulke"):
-            continue
-        seen_slugs.add(slug_lower)
-        
-        name_clean = lookup_name(html.unescape(name))
-        tvg = lookup_epg_id(slug_lower)
-        
-        ch = Channel(
-            number="",
-            name=name_clean,
-            url=href,
-            tvg_id=tvg,
-            logo=logo
-        )
-        ch.provider_urls["livedetv"] = href
-        channels.append(ch)
-        
-    return channels
-
-
-def resolve_livedetv_stream(channel_url: str) -> str:
-    cj = http.cookiejar.CookieJar() if "http.cookiejar" in globals() else http.cookiejar.CookieJar()
-    # build a clean custom opener to maintain PHP Session cookies across nested frame fetches
-    opener = build_opener(HTTPCookieProcessor(cj))
-    opener.addheaders = [
-        ("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
-        ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"),
-        ("Accept-Language", "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7")
-    ]
-    
-    try:
-        # Step 1: Open main channel page to start session cookies
-        req1 = Request(channel_url)
-        with opener.open(req1, timeout=8) as r1:
-            r1.read()
-            
-        # Step 2: Fetch embed frame page
-        slug = channel_url.rstrip("/").rsplit("/", 1)[-1]
-        embed_url = f"https://www.livedetv.com/embed/{slug}/"
-        req2 = Request(embed_url, headers={"Referer": channel_url})
-        with opener.open(req2, timeout=8) as r2:
-            embed_content = r2.read().decode("utf-8", errors="ignore")
-            
-        # Step 3: Fetch yayin page using dynamic security bcrypt token
-        yayin_match = re.search(r'<iframe[^>]+src=["\'](https?://www\.livedetv\.com/yayin/[^"\']+)["\']', embed_content)
-        if not yayin_match:
-            return ""
-            
-        yayin_url = yayin_match.group(1)
-        req3 = Request(
-            yayin_url,
-            headers={
-                "Referer": embed_url,
-                "Sec-Fetch-Dest": "iframe",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "same-origin"
-            }
-        )
-        with opener.open(req3, timeout=8) as r3:
-            yayin_content = r3.read().decode("utf-8", errors="ignore")
-            
-        # Step 4: Fetch token.php page
-        token_match = re.search(r'src=["\'](https?://www\.livedetv\.com/token\.php\?stream=[^"\']+)["\']', yayin_content)
-        if not token_match:
-            return ""
-            
-        token_url = token_match.group(1)
-        req4 = Request(token_url, headers={"Referer": yayin_url})
-        with opener.open(req4, timeout=8) as r4:
-            token_content = r4.read().decode("utf-8", errors="ignore")
-            
-        # Step 5: Extract final direct helpfullive.info HLS stream URL
-        m3u8_match = re.search(r'(https?://[^\s"\'`<>]+?\.m3u8[^\s"\'`<>]*)', token_content)
-        if m3u8_match:
-            return m3u8_match.group(1)
-            
-    except Exception as e:
-        print(f"Error resolving livedetv stream for {channel_url}: {e}", flush=True)
-    return ""
-
-
-# 3. Legacy 2ix2 Scraper & Resolver
-def get_2ix2_channels() -> list[Channel]:
-    homepage_url = "https://www.2ix2.com/"
-    req = Request(
-        homepage_url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-    )
-    try:
-        with urlopen(req, timeout=12) as response:
-            homepage = response.read().decode("utf-8", errors="ignore")
-    except Exception as e:
-        print(f"WARNING: Error scraping 2ix2 homepage: {e}", flush=True)
-        return []
-
-    matches = re.finditer(
-        r'href="(https://www\.2ix2\.com/([a-zA-Z0-9\-]+)/?)"[^>]*>\s*<img\s+src="([^"]+)"\s+alt="([^"]+)"',
-        homepage,
-        re.IGNORECASE
-    )
-
-    channels: list[Channel] = []
-    seen_urls = set()
-    for m in matches:
-        url, slug, logo, name = m.groups()
-        if url in seen_urls:
-            continue
-        seen_urls.add(url)
-        name_clean = lookup_name(html.unescape(name))
-        tvg = lookup_epg_id(slug.lower())
-        if logo.startswith("//"):
-            logo = "https:" + logo
-            
-        ch = Channel(
-            number="",
-            name=name_clean,
-            url=url,
-            tvg_id=tvg,
-            logo=logo
-        )
-        ch.provider_urls["2ix2"] = url
-        channels.append(ch)
-    return channels
-
-
-def resolve_2ix2_stream(page_url: str) -> str:
-    req = Request(
-        page_url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Referer": "https://www.2ix2.com/"
-        }
-    )
-    try:
-        with urlopen(req, timeout=10) as response:
-            content = response.read().decode("utf-8", errors="ignore")
-            match = re.search(r'file:\s*["\']([^"\']+)["\']', content)
-            if match:
-                val = match.group(1).strip()
-                if val and "[php_everywhere]" not in val:
-                    return val
-                else:
-                    print(f"WARNING: Player source for {page_url} contains '[php_everywhere]' or is empty on 2ix2.com.", flush=True)
-            else:
-                print(f"WARNING: No stream path (file:) found in player source code on {page_url}.", flush=True)
-    except Exception as e:
-        print(f"Error resolving 2ix2 stream {page_url}: {e}", flush=True)
-    return ""
+            base, page = fetch_page(PROVIDER_HOME[provider], headers)
+            url = tile_player(page, base, slug)
+        return resolve_tile_stream(url, headers) if url else ""
+    if provider == "livedetv":
+        return resolve_livedetv_stream(url, headers)
+    if provider == "2ix2":
+        base, page = fetch_page(url, headers)
+        return advertised_media(page, ProviderMarkup(page), base)
+    return url
 
 
 def parse_playlist() -> list[Channel]:
@@ -574,20 +548,10 @@ def parse_playlist() -> list[Channel]:
     ordered_keys: list[str] = []
 
     for provider in SCRAPER_PROVIDERS:
-        provider_clean = provider.lower().strip()
-        scraped: list[Channel] = []
-        
-        if provider_clean in ("2ix2tv", "2ix2tv.de"):
-            scraped = get_2ix2tv_channels("https://2ix2tv.de/")
-        elif provider_clean in ("nydus", "nydus.org", "lolmt2", "lolmt2.com", "raidrush", "raidrush.net"):
-            # nydus blocks non-JS clients; scrape its mirror lolmt2.com instead
-            scraped = get_2ix2tv_channels("https://lolmt2.com/")
-        elif provider_clean in ("livedetv", "livedetv.com"):
-            scraped = get_livedetv_channels()
-        elif provider_clean in ("2ix2", "2ix2.com"):
-            scraped = get_2ix2_channels()
-        else:
-            print(f"WARNING: Unknown scraper provider '{provider}' configured. Skipping.", flush=True)
+        try:
+            scraped = discover_provider(provider)
+        except UPSTREAM_ERRORS as error:
+            print(f"WARNING: Channel discovery for '{provider}' failed ({type(error).__name__}).", flush=True)
             continue
             
         print(f"INFO: Scraper provider '{provider}' returned {len(scraped)} channels.", flush=True)
@@ -670,6 +634,72 @@ def rewrite_manifest(body: bytes, origin: str, proxy_base: str) -> bytes:
     return ("\n".join(output) + "\n").encode("utf-8")
 
 
+MAX_MANIFEST_BYTES = 1024 * 1024
+TS_PACKET = 188
+
+
+def is_mpeg_ts(prefix: bytes) -> bool:
+    return len(prefix) >= 2 * TS_PACKET and prefix[0] == prefix[TS_PACKET] == 0x47
+
+
+def read_stream_prefix(response) -> tuple[list[str], bytes]:
+    """Recognize a manifest by its contents, never by its URL or MIME type."""
+    prefix = response.read(512)
+    first_line = prefix.split(b"\n", 1)[0].strip().removeprefix(b"\xef\xbb\xbf")
+    if first_line != b"#EXTM3U":
+        return [], prefix
+    body = prefix + response.read(MAX_MANIFEST_BYTES - len(prefix) + 1)
+    if len(body) > MAX_MANIFEST_BYTES:
+        raise ValueError("HLS manifest exceeds size limit")
+    return [line.strip() for line in body.decode("utf-8-sig").splitlines() if line.strip()], prefix
+
+
+def hls_entries(lines: list[str], tag: str):
+    for index, line in enumerate(lines[:-1]):
+        if line.startswith(tag) and not lines[index + 1].startswith("#"):
+            yield line, lines[index + 1]
+
+
+def variant_quality(tag: str) -> tuple[int, int]:
+    resolution = re.search(r"(?:[:,])RESOLUTION=(\d+)x(\d+)", tag)
+    bandwidth = re.search(r"(?:[:,])BANDWIDTH=(\d+)", tag)
+    pixels = int(resolution[1]) * int(resolution[2]) if resolution else 0
+    return pixels, int(bandwidth[1]) if bandwidth else 0
+
+
+def hls_input(lines: list[str], base: str, headers: dict[str, str], depth=0, deadline=None) -> str:
+    if any(http_url(base, uri) for _, uri in hls_entries(lines, "#EXTINF:")):
+        return base
+    if depth >= 2:
+        raise ValueError("no playable media playlist")
+    if deadline is None:
+        deadline = time.monotonic() + 10
+    variants = sorted(hls_entries(lines, "#EXT-X-STREAM-INF:"), key=lambda e: variant_quality(e[0]), reverse=True)
+    for tag, uri in variants[:6]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        target = http_url(base, uri)
+        if not target or target == base:
+            continue
+        audio_group = re.search(r'(?:[:,])AUDIO="([^"]+)"', tag)
+        external_audio = audio_group and any(
+            line.startswith("#EXT-X-MEDIA:") and "TYPE=AUDIO" in line
+            and f'GROUP-ID="{audio_group[1]}"' in line and 'URI="' in line for line in lines
+        )
+        if external_audio and not FFMPEG_FOUND:
+            continue
+        try:
+            with urlopen(Request(target, headers=headers), timeout=min(5, remaining)) as response:
+                child_lines, _ = read_stream_prefix(response)
+                resolved = hls_input(child_lines, response.url, headers, depth + 1, deadline)
+            # Keep the master when FFmpeg needs it to load the separate audio.
+            return base if external_audio else resolved
+        except UPSTREAM_ERRORS:
+            continue
+    raise ValueError("no playable media playlist")
+
+
 class TunerHandler(BaseHTTPRequestHandler):
     server_version = "IPTVTuner/1.0"
 
@@ -732,96 +762,13 @@ class TunerHandler(BaseHTTPRequestHandler):
         elif path.startswith("/stream/"):
             try:
                 index = int(path.rsplit("/", 1)[1])
+                if index < 0:
+                    raise IndexError
                 channel = parse_playlist()[index]
             except (ValueError, IndexError):
                 self.send_error(HTTPStatus.NOT_FOUND, "Unknown channel")
                 return
-            # Priority-based stream failover/resolution loop
-            stream_url = ""
-            stream_headers = {}
-            resolved_success = False
-            
-            # If the channel came from a custom playlist file, it won't have provider_urls mapped.
-            # In that case, we directly try to validate the primary URL.
-            urls_to_try = []
-            if channel.provider_urls:
-                for provider in SCRAPER_PROVIDERS:
-                    prov_key = provider.lower().strip()
-                    if prov_key in channel.provider_urls:
-                        urls_to_try.append((provider, channel.provider_urls[prov_key]))
-            else:
-                urls_to_try.append(("CustomM3U", channel.url))
-                
-            for provider, prov_url in urls_to_try:
-                print(f"INFO: Attempting to resolve stream for '{channel.name}' via provider '{provider}'...", flush=True)
-                resolved = ""
-                
-                prov_key = provider.lower().strip()
-                if prov_key in ("2ix2tv", "nydus", "lolmt2", "raidrush"):
-                    slug = prov_url.rstrip("/").rsplit("/", 1)[-1]
-                    resolved = resolve_2ix2tv_stream(slug)
-                elif prov_key in ("livedetv", "livedetv.com"):
-                    resolved = resolve_livedetv_stream(prov_url)
-                elif prov_key in ("2ix2", "2ix2.com"):
-                    resolved = resolve_2ix2_stream(prov_url)
-                else:
-                    # Custom M3U or direct HLS URL
-                    resolved = prov_url
-                    
-                if resolved:
-                    if "challenges.cloudflare.com" in resolved or "/embed.php" in resolved:
-                        print(f"WARNING: Stream for '{channel.name}' on provider '{provider}' is protected by Cloudflare and cannot be tuned directly.", flush=True)
-                        continue
-                        
-                    # Validate the resolved stream URL immediately inside the loop
-                    headers = get_provider_headers(provider)
-                    req = Request(resolved, headers=headers)
-                    try:
-                        with urlopen(req, timeout=8) as response:
-                            content_type = response.headers.get_content_type()
-                            body_bytes = response.read()
-                            body_str = body_bytes.decode("utf-8", errors="ignore")
-                            resolved_url = response.url
-                            
-                            is_hls = content_type in {"application/vnd.apple.mpegurl", "application/x-mpegurl"} or urlparse(resolved).path.lower().endswith(".m3u8") or "#EXTM3U" in body_str
-                            
-                            if is_hls:
-                                # Extract child playlist if it is a master playlist
-                                if "#EXT-X-STREAM-INF:" in body_str:
-                                    video_url = ""
-                                    for line in body_str.splitlines():
-                                        line = line.strip()
-                                        if line and not line.startswith("#"):
-                                            video_url = urljoin(resolved_url, line)
-                                            break
-                                    if video_url:
-                                        if "/proxy?url=" in video_url:
-                                            video_url = unquote(video_url.split("/proxy?url=", 1)[1])
-                                        resolved = video_url
-                                
-                            stream_url = resolved
-                            stream_headers = headers
-                            resolved_success = True
-                            print(f"INFO: Successfully validated stream for '{channel.name}' via provider '{provider}': {stream_url}", flush=True)
-                            break
-                    except Exception as e:
-                        print(f"WARNING: Stream validation failed for '{channel.name}' on provider '{provider}' ({e}). Trying next fallback...", flush=True)
-                else:
-                    print(f"WARNING: Resolution for '{channel.name}' via provider '{provider}' failed or returned empty. Trying next fallback...", flush=True)
-            
-            if not resolved_success:
-                print(f"ERROR: Stream for '{channel.name}' could not be resolved or validated by any of the configured providers: {SCRAPER_PROVIDERS}", flush=True)
-                self.send_error(HTTPStatus.BAD_GATEWAY, f"Stream for '{channel.name}' is currently not available on any providers.")
-                return
-
-            # Determine HLS
-            is_hls = urlparse(stream_url).path.lower().endswith(".m3u8") or "index.m3u8" in stream_url or "playlist.m3u8" in stream_url
-            
-            if is_hls:
-                print(f"Starting continuous HLS-to-TS stream for: {stream_url}", flush=True)
-                self.stream_hls_as_ts(stream_url, stream_headers)
-            else:
-                self.proxy(stream_url, base, stream_headers)
+            self.tune(channel)
         elif path == "/proxy":
             target = unquote(parsed.query.removeprefix("url="))
             if not target.startswith(("http://", "https://")):
@@ -834,16 +781,67 @@ class TunerHandler(BaseHTTPRequestHandler):
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 
-    def stream_hls_as_ts(self, m3u8_url: str, stream_headers: dict[str, str]) -> None:
+    def tune(self, channel: Channel) -> None:
+        custom = not channel.provider_urls
+        candidates = (
+            [(provider_for_url(channel.url), channel.url)] if custom else
+            [(provider, channel.provider_urls[provider])
+             for provider in SCRAPER_PROVIDERS if provider in channel.provider_urls]
+        )
+        for provider, url in candidates:
+            label = provider or "CustomM3U"
+            self.tune_source = (channel.name, label)
+            print(f"INFO: Trying '{channel.name}' via '{label}'.", flush=True)
+            headers = get_provider_headers(provider)
+            try:
+                target = resolve_candidate(provider, url, headers, custom=custom)
+                if http_url("", target) and self.stream_candidate(target, headers):
+                    return
+            except UPSTREAM_ERRORS as error:
+                code = f" HTTP {error.code}" if isinstance(error, HTTPError) else ""
+                print(f"WARNING: Source '{label}' failed ({type(error).__name__}{code}).", flush=True)
+            print(f"INFO: No playable stream from '{label}'; trying the next source.", flush=True)
+        self.send_error(HTTPStatus.BAD_GATEWAY, "No configured source could start this channel")
+
+    def begin_ts_response(self) -> None:
+        channel, provider = self.tune_source
+        print(f"INFO: Streaming '{channel}' via '{provider}'.", flush=True)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "video/mp2t")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def stream_candidate(self, url: str, headers: dict[str, str]) -> bool:
+        with urlopen(Request(url, headers=headers), timeout=6) as response:
+            lines, prefix = read_stream_prefix(response)
+            if lines:
+                playlist = hls_input(lines, response.url, headers)
+            elif is_mpeg_ts(prefix):
+                try:
+                    self.begin_ts_response()
+                    self.wfile.write(prefix)
+                    while chunk := response.read(64 * 1024):
+                        self.wfile.write(chunk)
+                except UPSTREAM_ERRORS:
+                    pass  # The response has already started; never send another status.
+                return True
+            else:
+                return False
+        return self.stream_hls_as_ts(playlist, headers)
+
+    def stream_hls_as_ts(self, m3u8_url: str, stream_headers: dict[str, str]) -> bool:
         """Stream HLS playlist segments as a continuous MPEG-TS stream to the client."""
         if FFMPEG_FOUND:
-            # Build ffmpeg command using custom headers to bypass hotlink checks
+            # Use the same request context for playback as for validation.
             headers_str = "".join(f"{k}: {v}\r\n" for k, v in stream_headers.items())
             
             cmd = [
                 "ffmpeg",
+                "-nostdin",
+                "-rw_timeout", "5000000",
                 "-headers", headers_str,
                 "-re",
+                "-f", "hls",
                 "-i", m3u8_url
             ]
             
@@ -891,90 +889,91 @@ class TunerHandler(BaseHTTPRequestHandler):
                 "pipe:1"
             ])
             
-            print(f"Launching ffmpeg remuxer/upscaler: {' '.join(cmd)}", flush=True)
             try:
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            except Exception as e:
-                print(f"Error launching ffmpeg remuxer: {e}", flush=True)
-                self.send_error(HTTPStatus.BAD_GATEWAY, f"Failed to launch ffmpeg remuxer: {e}")
-                return
-                
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "video/mp2t")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Connection", "keep-alive")
-            self.end_headers()
-            
-            try:
-                while True:
-                    chunk = proc.stdout.read(64 * 1024)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-            except (BrokenPipeError, ConnectionResetError):
-                print("Client disconnected from remuxed TS stream", flush=True)
-            finally:
-                proc.terminate()
-                proc.wait()
-            return
+            except OSError as error:
+                print(f"WARNING: FFmpeg launch failed ({type(error).__name__}).", flush=True)
+                return False
 
-        # Fallback Python segment downloader loop (only used if ffmpeg is missing)
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "video/mp2t")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Connection", "keep-alive")
-        self.end_headers()
+            first_chunk = Queue(maxsize=1)
 
-        sent_segments = set()
-
-        while True:
-            # Fetch the playlist
-            req = Request(m3u8_url, headers=stream_headers)
-            try:
-                with urlopen(req, timeout=10) as resp:
-                    playlist_content = resp.read().decode("utf-8", errors="ignore")
-                    playlist_url = resp.url
-            except Exception as e:
-                print(f"Error fetching HLS playlist in fallback loop: {e}", flush=True)
-                time.sleep(2)
-                continue
-
-            # Parse segments
-            lines = playlist_content.splitlines()
-            segments = []
-            target_duration = 6.0
-            for line in lines:
-                line = line.strip()
-                if line.startswith("#EXT-X-TARGETDURATION:"):
-                    try:
-                        target_duration = float(line.split(":", 1)[1])
-                    except ValueError:
-                        pass
-                elif line and not line.startswith("#"):
-                    segments.append(urljoin(playlist_url, line))
-
-            # Send new segments
-            new_segments = [s for s in segments if s not in sent_segments]
-            for seg_url in new_segments:
-                print(f"Streaming HLS segment to client (fallback): {seg_url}", flush=True)
-                seg_req = Request(seg_url, headers=stream_headers)
+            def read_start() -> None:
                 try:
-                    with urlopen(seg_req, timeout=15) as seg_resp:
-                        while chunk := seg_resp.read(64 * 1024):
-                            self.wfile.write(chunk)
-                    sent_segments.add(seg_url)
-                except (BrokenPipeError, ConnectionResetError):
-                    print("Client disconnected from TS stream", flush=True)
-                    return
-                except Exception as e:
-                    print(f"Error streaming TS segment {seg_url}: {e}", flush=True)
+                    first_chunk.put(proc.stdout.read1(64 * 1024))
+                except OSError:
+                    first_chunk.put(b"")
 
-            # Keep set size reasonable
-            if len(sent_segments) > 100:
-                sent_segments = set(list(sent_segments)[-20:])
+            Thread(target=read_start, daemon=True).start()
+            try:
+                try:
+                    chunk = first_chunk.get(timeout=12)
+                except Empty:
+                    print("WARNING: FFmpeg timed out before producing stream data.", flush=True)
+                    return False
+                if not chunk:
+                    print("WARNING: FFmpeg exited before producing stream data.", flush=True)
+                    return False
+                try:
+                    self.begin_ts_response()
+                    while chunk:
+                        self.wfile.write(chunk)
+                        chunk = proc.stdout.read1(64 * 1024)
+                except OSError:
+                    pass
+                return True
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                proc.stdout.close()
 
-            # Sleep for half of target duration (e.g. 3s)
-            time.sleep(max(1.0, target_duration / 2.0))
+        # Without FFmpeg, only unencrypted, already-multiplexed TS segments work.
+        sent_segments: set[str] = set()
+        started = False
+        while True:
+            try:
+                with urlopen(Request(m3u8_url, headers=stream_headers), timeout=6) as response:
+                    lines, _ = read_stream_prefix(response)
+                    base = response.url
+                if any(line.startswith(("#EXT-X-MAP:", "#EXT-X-BYTERANGE:")) or (
+                    line.startswith("#EXT-X-KEY:") and line != "#EXT-X-KEY:METHOD=NONE"
+                ) for line in lines):
+                    return started
+                segments = [url for _, uri in hls_entries(lines, "#EXTINF:") if (url := http_url(base, uri))]
+                if not segments:
+                    return started
+                for segment in segments:
+                    if segment in sent_segments:
+                        continue
+                    try:
+                        with urlopen(Request(segment, headers=stream_headers), timeout=6) as response:
+                            prefix = response.read(2 * TS_PACKET)
+                            if not is_mpeg_ts(prefix):
+                                continue
+                            if not started:
+                                started = True
+                                self.begin_ts_response()
+                            self.wfile.write(prefix)
+                            while chunk := response.read(64 * 1024):
+                                self.wfile.write(chunk)
+                        sent_segments.add(segment)
+                    except (BrokenPipeError, ConnectionResetError):
+                        return started
+                    except UPSTREAM_ERRORS:
+                        if started:
+                            return True
+                if not started or "#EXT-X-ENDLIST" in lines:
+                    return started
+                sent_segments.intersection_update(segments)
+                duration = next((line.split(":", 1)[1] for line in lines
+                                 if line.startswith("#EXT-X-TARGETDURATION:")), "6")
+                time.sleep(min(15, max(1, float(duration) / 2)))
+            except UPSTREAM_ERRORS:
+                return started
 
     def proxy(self, target: str, base: str, stream_headers: dict[str, str]) -> None:
         request = Request(target, headers=stream_headers)
