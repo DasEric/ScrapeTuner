@@ -18,12 +18,13 @@ from http import HTTPStatus
 from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html.parser import HTMLParser
+from itertools import islice
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Thread
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urljoin, urlparse
-from urllib.request import Request, urlopen, HTTPCookieProcessor, build_opener
+from urllib.request import Request, urlopen, HTTPRedirectHandler, HTTPCookieProcessor, build_opener
 
 PORT = int(os.environ.get("PORT", "5004"))
 CONFIG_DIR = Path(os.environ.get("CONFIG_DIR", "/config"))
@@ -108,6 +109,7 @@ PROVIDER_ALIASES = {
     urlparse(url).hostname.removeprefix("www."): key for key, url in PROVIDER_HOME.items()
 }
 TILE_PROVIDERS = {"2ix2tv", "lolmt2", "nydus", "raidrush"}
+TILE_EMBED_HOST = re.compile(r"s\d+\.(?:2ix2tv|2ix2com)\.de")
 
 
 def normalize_providers(values: list[str]) -> list[str]:
@@ -413,7 +415,8 @@ def tile_player(page: str, base: str, slug: str) -> str:
     if special:
         return http_url(base, special[2])
     template = re.search(
-        r"""\bplayer\.src\s*=\s*(['"])([^'"]+)\1\s*\+\s*id\b(?:\s*\+\s*(['"])([^'"]*)\3)?""",
+        r"""\bplayer\.src\s*=\s*(['"])([^'"]+)\1\s*\+\s*(?:id\b|encodeURIComponent\(\s*id\s*\))"""
+        r"""(?:\s*\+\s*(['"])([^'"]*)\3(?!\s*\+))?""",
         page,
     )
     return http_url(base, template[2] + quote(slug, safe="") + (template[4] or "")) if template else ""
@@ -453,19 +456,55 @@ PLAYER_SOURCE = re.compile(r"""\b(?:file|source)\s*:\s*(['"])([^'"]+)\1""", re.I
 HLS_LITERAL = re.compile(r"""((?:https?://|//|/|\.\.?/)[^\s"'<>]+?\.m3u8(?:[?#][^\s"'<>]*)?)""", re.I)
 
 
-def advertised_media(page: str, markup: ProviderMarkup, base: str, *, hls_literals=False) -> str:
+def advertised_media_urls(page: str, markup: ProviderMarkup, base: str, *, hls_literals=False):
     player = page.replace(r"\/", "/").replace("&amp;", "&")
     sources = [*markup.media, *(m[2] for m in PLAYER_SOURCE.finditer(player))]
     if hls_literals:
         sources.extend(HLS_LITERAL.findall(player))
-    return next((url for source in sources if (url := http_url(base, source))), "")
+    seen = set()
+    for source in sources:
+        if (url := http_url(base, source)) and url not in seen:
+            seen.add(url)
+            yield url
+
+
+def advertised_media(page: str, markup: ProviderMarkup, base: str) -> str:
+    return next(advertised_media_urls(page, markup, base), "")
 
 
 class BrowserPlayerOnly(ValueError):
     """The provider advertises a browser player, but no direct stream."""
 
 
-def resolve_tile_stream(player_url: str, headers: dict[str, str]) -> str:
+@dataclass(frozen=True)
+class WrappedHls:
+    url: str
+    host: str
+    segment_offset: int
+
+    def allows(self, url: str) -> bool:
+        parsed = urlparse(url)
+        return parsed.scheme == "https" and parsed.netloc.lower() == self.host
+
+
+def advertised_wrapped_hls(page: str, base: str) -> WrappedHls | None:
+    """Recognize the player configuration, without executing any scripts."""
+    host = urlparse(base).netloc.lower()
+    if not TILE_EMBED_HOST.fullmatch(host):
+        return None
+    match = re.search(r"\bconst\s+EMBED\s*=\s*(?=\{)", page)
+    if not match:
+        return None
+    data, _ = json.JSONDecoder().raw_decode(page, match.end())
+    source, offset = data.get("streamUrl"), data.get("hostLengthOffset")
+    if not isinstance(source, str) or type(offset) is not int or not 0 <= offset <= 64:
+        return None
+    url = http_url(base, source)
+    stream = WrappedHls(url, host, 32 + offset)
+    return stream if stream.allows(url) and urlparse(url).path == "/conv/conv.php" else None
+
+
+def resolve_tile_stream(player_url: str, headers: dict[str, str]) -> str | WrappedHls:
     base, page = fetch_page(player_url, headers)
     markup = ProviderMarkup(page)
     if source := advertised_media(page, markup, base):
@@ -493,20 +532,24 @@ def resolve_tile_stream(player_url: str, headers: dict[str, str]) -> str:
             if target and parsed.path == "/embed.php":
                 # Inspect only the known provider's HTTPS player page, once.
                 # It may publish a regular HTML media source without scripts.
-                if parsed.scheme == "https" and re.fullmatch(r"s\d+\.2ix2tv\.de", parsed.hostname or ""):
+                if parsed.scheme == "https" and TILE_EMBED_HOST.fullmatch(parsed.netloc.lower()):
                     frame, content = fetch_page(target, {**headers, "Referer": urljoin(base, "/")})
                     if source := advertised_media(content, ProviderMarkup(content), frame):
                         return source
+                    if wrapped := advertised_wrapped_hls(content, frame):
+                        return wrapped
                 raise BrowserPlayerOnly
     except (binascii.Error, UnicodeError):
         pass
     return ""
 
 
-def resolve_livedetv_stream(channel_url: str, headers: dict[str, str]) -> str:
+def livedetv_candidates(channel_url: str, headers: dict[str, str]):
     opener = build_opener(HTTPCookieProcessor(http.cookiejar.CookieJar()))
     pending = [(channel_url, headers["Referer"])]
+    channel_path = urlparse(channel_url).path.removeprefix("/embed/").strip("/")
     seen = set()
+    sources = set()
     # Follow actual same-site player frames, including the direct /yayin/ frame
     # on channel pages. The site's /embed/ wrapper is just another entry point.
     while pending and len(seen) < 6:
@@ -521,38 +564,48 @@ def resolve_livedetv_stream(channel_url: str, headers: dict[str, str]) -> str:
         if provider_for_url(base) != "livedetv":
             continue
         markup = ProviderMarkup(page)
-        if source := advertised_media(page, markup, base, hls_literals=urlparse(base).path == "/token.php"):
-            return source
+        for source in advertised_media_urls(page, markup, base, hls_literals=urlparse(base).path == "/token.php"):
+            if source not in sources:
+                sources.add(source)
+                yield source
         frames = []
-        for frame in markup.frames:
+        urls = list(markup.frames)
+        if url == channel_url:
+            # Some pages expose their alternate embed only as copyable HTML.
+            for snippet in re.findall(r"<textarea\b[^>]*>(.*?)</textarea\s*>", page, re.I | re.S):
+                urls.extend(ProviderMarkup(html.unescape(snippet)).frames)
+        for frame in urls:
             target = http_url(base, frame)
             if provider_for_url(target) != "livedetv":
                 continue
             path = urlparse(target).path
+            if path.startswith("/embed/") and path.removeprefix("/embed/").strip("/") != channel_path:
+                continue
             if path.startswith(("/embed/", "/yayin/")) or path == "/token.php":
                 frames.append((target, base))
         pending[0:0] = frames
-    return ""
 
 
-def resolve_candidate(provider: str, url: str, headers: dict[str, str], *, custom=False) -> str:
+def resolve_candidates(provider: str, url: str, headers: dict[str, str], *, custom=False):
     # M3U entries can be direct streams or supported public player pages.
     if custom and urlparse(url).path.lower().endswith((".m3u8", ".ts")):
-        return url
-    if provider in TILE_PROVIDERS:
+        yield url
+    elif provider in TILE_PROVIDERS:
         if custom:
             slug = urlparse(url).path.strip("/")
             if not re.fullmatch(r"[a-zA-Z0-9_-]+", slug):
-                return ""
+                return
             base, page = fetch_page(PROVIDER_HOME[provider], headers)
             url = tile_player(page, base, slug)
-        return resolve_tile_stream(url, headers) if url else ""
-    if provider == "livedetv":
-        return resolve_livedetv_stream(url, headers)
-    if provider == "2ix2":
+        if url:
+            yield resolve_tile_stream(url, headers)
+    elif provider == "livedetv":
+        yield from livedetv_candidates(url, headers)
+    elif provider == "2ix2":
         base, page = fetch_page(url, headers)
-        return advertised_media(page, ProviderMarkup(page), base)
-    return url
+        yield from advertised_media_urls(page, ProviderMarkup(page), base)
+    else:
+        yield url
 
 
 def parse_playlist() -> list[Channel]:
@@ -670,6 +723,7 @@ def rewrite_manifest(body: bytes, origin: str, proxy_base: str) -> bytes:
 
 
 MAX_MANIFEST_BYTES = 1024 * 1024
+MAX_WRAPPED_SEGMENT_BYTES = 16 * 1024 * 1024
 TS_PACKET = 188
 
 
@@ -690,9 +744,13 @@ def read_stream_prefix(response) -> tuple[list[str], bytes]:
 
 
 def hls_entries(lines: list[str], tag: str):
-    for index, line in enumerate(lines[:-1]):
-        if line.startswith(tag) and not lines[index + 1].startswith("#"):
-            yield line, lines[index + 1]
+    pending = None
+    for line in lines:
+        if line.startswith(tag):
+            pending = line
+        elif pending and line and not line.startswith("#"):
+            yield pending, line
+            pending = None
 
 
 def variant_quality(tag: str) -> tuple[int, int]:
@@ -702,7 +760,9 @@ def variant_quality(tag: str) -> tuple[int, int]:
     return pixels, int(bandwidth[1]) if bandwidth else 0
 
 
-def hls_input(lines: list[str], base: str, headers: dict[str, str], depth=0, deadline=None) -> str:
+def hls_input(
+    lines: list[str], base: str, headers: dict[str, str], depth=0, deadline=None, *, wrapped_open=None,
+) -> str:
     if any(http_url(base, uri) for _, uri in hls_entries(lines, "#EXTINF:")):
         return base
     if depth >= 2:
@@ -722,17 +782,54 @@ def hls_input(lines: list[str], base: str, headers: dict[str, str], depth=0, dea
             line.startswith("#EXT-X-MEDIA:") and "TYPE=AUDIO" in line
             and f'GROUP-ID="{audio_group[1]}"' in line and 'URI="' in line for line in lines
         )
-        if external_audio and not FFMPEG_FOUND:
+        if external_audio and (wrapped_open or not FFMPEG_FOUND):
             continue
         try:
-            with urlopen(Request(target, headers=headers), timeout=min(5, remaining)) as response:
+            with (wrapped_open or urlopen)(Request(target, headers=headers), timeout=min(5, remaining)) as response:
                 child_lines, _ = read_stream_prefix(response)
-                resolved = hls_input(child_lines, response.url, headers, depth + 1, deadline)
+                resolved = hls_input(child_lines, response.url, headers, depth + 1, deadline, wrapped_open=wrapped_open)
             # Keep the master when FFmpeg needs it to load the separate audio.
             return base if external_audio else resolved
         except UPSTREAM_ERRORS:
             continue
     raise ValueError("no playable media playlist")
+
+
+def wrapped_opener(source: WrappedHls):
+    class SameOriginRedirect(HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            if not source.allows(newurl):
+                raise ValueError("cross-origin redirect in wrapped HLS")
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    opener = build_opener(SameOriginRedirect())
+
+    def open_url(request, *, timeout):
+        if not source.allows(request.full_url):
+            raise ValueError("cross-origin URL in wrapped HLS")
+        return opener.open(request, timeout=timeout)
+
+    return open_url
+
+
+def read_wrapped_segment(response, offset: int) -> bytes:
+    """Read the unencrypted TS payload carried as hex in this player's BMP envelope."""
+    if not urlparse(response.url).path.lower().endswith(".tsl.bmp"):
+        return b""
+    payload = response.read(MAX_WRAPPED_SEGMENT_BYTES + 1)
+    if len(payload) > MAX_WRAPPED_SEGMENT_BYTES or not payload.startswith(b"BM"):
+        return b""
+    try:
+        data = binascii.unhexlify(payload[offset:])
+    except binascii.Error:
+        return b""
+    if (
+        not is_mpeg_ts(data)
+        or len(data) % TS_PACKET
+        or any(data[pos] != 0x47 for pos in range(0, len(data), TS_PACKET))
+    ):
+        return b""
+    return data
 
 
 class TunerHandler(BaseHTTPRequestHandler):
@@ -830,20 +927,52 @@ class TunerHandler(BaseHTTPRequestHandler):
             self.tune_source = (channel.name, label)
             print(f"INFO: Trying '{channel.name}' via '{label}'.", flush=True)
             headers = get_provider_headers(provider)
+            stalled_endpoints: set[tuple[str, str, str]] = set()
             try:
-                target = url if provider == "ChannelOverride" else resolve_candidate(provider, url, headers, custom=custom)
-                if http_url("", target) and self.stream_candidate(target, headers):
-                    return
+                sources = (url,) if provider == "ChannelOverride" else resolve_candidates(
+                    provider, url, headers, custom=custom,
+                )
+                for target in islice(sources, 4):
+                    if self.try_source(target, headers, label, stalled_endpoints):
+                        return
             except BrowserPlayerOnly:
                 print(f"WARNING: Source '{label}' advertises a browser player without a direct stream URL.", flush=True)
             except UPSTREAM_ERRORS as error:
-                if isinstance(error, HTTPError) and error.headers and error.headers.get("CF-Mitigated", "").lower() == "challenge":
-                    print(f"WARNING: Source '{label}' requires a browser challenge (HTTP {error.code}).", flush=True)
-                else:
-                    code = f" HTTP {error.code}" if isinstance(error, HTTPError) else ""
-                    print(f"WARNING: Source '{label}' failed ({type(error).__name__}{code}).", flush=True)
+                self.log_source_error(label, error)
             print(f"INFO: No playable stream from '{label}'; trying the next source.", flush=True)
         self.send_error(HTTPStatus.BAD_GATEWAY, "No configured source could start this channel")
+
+    @staticmethod
+    def log_source_error(label: str, error: Exception) -> None:
+        if isinstance(error, HTTPError):
+            if error.headers and error.headers.get("CF-Mitigated", "").lower() == "challenge":
+                print(f"WARNING: Source '{label}' requires a browser challenge (HTTP {error.code}).", flush=True)
+                return
+            reason = f"HTTP {error.code}"
+        else:
+            reason = type(error).__name__
+        print(f"WARNING: Source '{label}' failed ({reason}).", flush=True)
+
+    def try_source(
+        self, target: str | WrappedHls, headers: dict[str, str], label: str,
+        stalled_endpoints: set[tuple[str, str, str]],
+    ) -> bool:
+        endpoint = None
+        try:
+            parsed = urlparse(target.url if isinstance(target, WrappedHls) else target)
+            endpoint = parsed.scheme, parsed.netloc, parsed.path
+            if endpoint in stalled_endpoints:
+                return False
+            if isinstance(target, WrappedHls):
+                return self.stream_wrapped_hls(target)
+            return bool(http_url("", target)) and self.stream_candidate(target, headers)
+        except UPSTREAM_ERRORS as error:
+            # Different session tokens can point to the same unresponsive server path.
+            cause = error.reason if isinstance(error, URLError) else error
+            if endpoint and isinstance(cause, TimeoutError):
+                stalled_endpoints.add(endpoint)
+            self.log_source_error(label, error)
+            return False
 
     def begin_ts_response(self) -> None:
         channel, provider = self.tune_source
@@ -870,6 +999,15 @@ class TunerHandler(BaseHTTPRequestHandler):
             else:
                 return False
         return self.stream_hls_as_ts(playlist, headers)
+
+    def stream_wrapped_hls(self, source: WrappedHls) -> bool:
+        # The player advertises a public manifest; send only validated TS payloads.
+        headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
+        open_url = wrapped_opener(source)
+        with open_url(Request(source.url, headers=headers), timeout=6) as response:
+            lines, _ = read_stream_prefix(response)
+            playlist = hls_input(lines, response.url, headers, wrapped_open=open_url)
+        return self.stream_ts_segments(playlist, headers, wrapped=source, open_url=open_url)
 
     def stream_hls_as_ts(self, m3u8_url: str, stream_headers: dict[str, str]) -> bool:
         """Stream HLS playlist segments as a continuous MPEG-TS stream to the client."""
@@ -973,12 +1111,19 @@ class TunerHandler(BaseHTTPRequestHandler):
                     proc.wait()
                 proc.stdout.close()
 
-        # Without FFmpeg, only unencrypted, already-multiplexed TS segments work.
+        return self.stream_ts_segments(m3u8_url, stream_headers)
+
+    def stream_ts_segments(
+        self, m3u8_url: str, stream_headers: dict[str, str], *, wrapped: WrappedHls | None = None, open_url=None,
+    ) -> bool:
+        # This path sends only unencrypted, already-multiplexed TS.
+        open_url = open_url or urlopen
         sent_segments: set[str] = set()
         started = False
+        last_progress = time.monotonic()
         while True:
             try:
-                with urlopen(Request(m3u8_url, headers=stream_headers), timeout=6) as response:
+                with open_url(Request(m3u8_url, headers=stream_headers), timeout=6) as response:
                     lines, _ = read_stream_prefix(response)
                     base = response.url
                 if any(line.startswith(("#EXT-X-MAP:", "#EXT-X-BYTERANGE:")) or (
@@ -988,21 +1133,30 @@ class TunerHandler(BaseHTTPRequestHandler):
                 segments = [url for _, uri in hls_entries(lines, "#EXTINF:") if (url := http_url(base, uri))]
                 if not segments:
                     return started
+                if wrapped and not sent_segments and not started and "#EXT-X-ENDLIST" not in lines:
+                    # Start near the live edge rather than buffering a full window.
+                    sent_segments.update(segments[:-3])
                 for segment in segments:
                     if segment in sent_segments:
                         continue
                     try:
-                        with urlopen(Request(segment, headers=stream_headers), timeout=6) as response:
-                            prefix = response.read(2 * TS_PACKET)
-                            if not is_mpeg_ts(prefix):
+                        with open_url(Request(segment, headers=stream_headers), timeout=6) as response:
+                            if wrapped:
+                                data = read_wrapped_segment(response, wrapped.segment_offset)
+                            else:
+                                prefix = response.read(2 * TS_PACKET)
+                                data = prefix if is_mpeg_ts(prefix) else b""
+                            if not data:
                                 continue
                             if not started:
                                 started = True
                                 self.begin_ts_response()
-                            self.wfile.write(prefix)
-                            while chunk := response.read(64 * 1024):
-                                self.wfile.write(chunk)
+                            self.wfile.write(data)
+                            if not wrapped:
+                                while chunk := response.read(64 * 1024):
+                                    self.wfile.write(chunk)
                         sent_segments.add(segment)
+                        last_progress = time.monotonic()
                     except (BrokenPipeError, ConnectionResetError):
                         return started
                     except UPSTREAM_ERRORS:
@@ -1013,7 +1167,10 @@ class TunerHandler(BaseHTTPRequestHandler):
                 sent_segments.intersection_update(segments)
                 duration = next((line.split(":", 1)[1] for line in lines
                                  if line.startswith("#EXT-X-TARGETDURATION:")), "6")
-                time.sleep(min(15, max(1, float(duration) / 2)))
+                duration = float(duration)
+                if time.monotonic() - last_progress > max(15, duration * 3):
+                    return started
+                time.sleep(min(15, max(1, duration / 2)))
             except UPSTREAM_ERRORS:
                 return started
 

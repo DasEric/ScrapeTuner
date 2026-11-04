@@ -54,7 +54,9 @@ In auto-discovery mode, ScrapeTuner reads each provider's own channel listing an
 
 * **`SCRAPER_PROVIDERS`** sets the order in which sources are tried. The default is `2ix2tv,livedetv,lolmt2,2ix2`, with legacy `2ix2.com` tried last. Use `2ix2tv,livedetv,lolmt2` to disable the legacy source entirely. A value in `config.json` takes precedence over the environment variable; restart the tuner after changing it.
 * A successful HTTP status is not enough: a source must return a playable HLS playlist or MPEG-TS data. An HTML player/error page, an invalid manifest, or a remuxer that produces no initial data triggers the next candidate. The tuner logs the provider that starts playback. If all candidates fail, it returns HTTP 502. Once playback has started, the tuner does not switch sources within that connection.
+* When `livedetv` or `2ix2` publishes more than one player source, ScrapeTuner tries the alternatives before moving to another provider. It does not repeat a timed-out request to the same server path just because a second URL has a different session token.
 * Auto-discovery is used only when there is no custom `channels.m3u`. A custom playlist uses the URLs you provide, without auto-discovery failover.
+* Some channels, such as VOXup on 2ix2tv and lolmt2, advertise HLS with MPEG-TS segments wrapped in BMP envelopes. ScrapeTuner reads and validates those segments and streams the original MPEG-TS to the client. This path passes through the original video and audio without upscaling. If a provider advertises a different format or returns a browser challenge, the tuner tries the next configured source.
 
 #### Use a direct stream for one channel
 
