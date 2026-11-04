@@ -43,7 +43,8 @@ config_data = {
     "TRANSCODE_RESOLUTION": os.environ.get("TRANSCODE_RESOLUTION", "1920x1080"),
     "TRANSCODE_SHARPEN": 0.5,
     "TRANSCODE_DENOISE": 1.0,
-    "SCRAPER_PROVIDERS": default_providers
+    "SCRAPER_PROVIDERS": default_providers,
+    "CHANNEL_SOURCE_OVERRIDES": {},
 }
 
 # Try reading from config.json if it exists
@@ -70,6 +71,8 @@ if CONFIG_FILE.exists():
                 config_data["SCRAPER_PROVIDERS"] = [str(p).strip() for p in provs if str(p).strip()]
             elif isinstance(provs, str):
                 config_data["SCRAPER_PROVIDERS"] = [p.strip() for p in provs.split(",") if p.strip()]
+        if "CHANNEL_SOURCE_OVERRIDES" in loaded:
+            config_data["CHANNEL_SOURCE_OVERRIDES"] = loaded["CHANNEL_SOURCE_OVERRIDES"]
         print(f"INFO: Loaded configuration from {CONFIG_FILE.name}", flush=True)
     except Exception as e:
         print(f"WARNING: Error reading config.json ({e}), using environment defaults.", flush=True)
@@ -372,6 +375,27 @@ def http_url(base: str, value: str) -> str:
     return url if parsed.scheme in ("http", "https") and parsed.hostname else ""
 
 
+def normalize_channel_overrides(values: object) -> dict[str, str]:
+    if not isinstance(values, dict):
+        print("WARNING: CHANNEL_SOURCE_OVERRIDES must map channel IDs to direct stream URLs.", flush=True)
+        return {}
+    overrides = {}
+    for channel_id, source in values.items():
+        key = channel_id.strip().casefold() if isinstance(channel_id, str) else ""
+        try:
+            url = http_url("", source) if isinstance(source, str) else ""
+        except ValueError:
+            url = ""
+        if not key or not url:
+            print("WARNING: Ignoring invalid entry in CHANNEL_SOURCE_OVERRIDES.", flush=True)
+            continue
+        overrides[key] = url
+    return overrides
+
+
+CHANNEL_SOURCE_OVERRIDES = normalize_channel_overrides(config_data["CHANNEL_SOURCE_OVERRIDES"])
+
+
 def provider_for_url(url: str) -> str:
     try:
         hostname = urlparse(url).hostname or ""
@@ -437,14 +461,17 @@ def advertised_media(page: str, markup: ProviderMarkup, base: str, *, hls_litera
     return next((url for source in sources if (url := http_url(base, source))), "")
 
 
+class BrowserPlayerOnly(ValueError):
+    """The provider advertises a browser player, but no direct stream."""
+
+
 def resolve_tile_stream(player_url: str, headers: dict[str, str]) -> str:
     base, page = fetch_page(player_url, headers)
     markup = ProviderMarkup(page)
     if source := advertised_media(page, markup, base):
         return source
 
-    # Older and current players can wrap a literal source in base64. Read the
-    # data only; do not execute the player's JavaScript or navigate gated frames.
+    # Older and current players can wrap a literal source in base64.
     packed = re.search(r"""\b(?:var|let|const)\s+zdec\s*=\s*(['"])([A-Za-z0-9+/=]+)\1""", page)
     if not packed:
         return ""
@@ -458,11 +485,19 @@ def resolve_tile_stream(player_url: str, headers: dict[str, str]) -> str:
             value = player[2] or base64.b64decode(player[4], validate=True).decode("utf-8")
             target = http_url(base, value)
             parsed = urlparse(target)
-            if target and parsed.path.lower().endswith(".m3u8"):
+            if target and parsed.path.lower().endswith((".m3u8", ".ts")):
                 return target
             if (parsed.hostname or "").endswith(".hopslan.com") and parsed.path.endswith("/embed.html"):
                 # This Flussonic player serves HLS in the same stream directory.
                 return parsed._replace(path=parsed.path.removesuffix("embed.html") + "index.m3u8", fragment="").geturl()
+            if target and parsed.path == "/embed.php":
+                # Inspect only the known provider's HTTPS player page, once.
+                # It may publish a regular HTML media source without scripts.
+                if parsed.scheme == "https" and re.fullmatch(r"s\d+\.2ix2tv\.de", parsed.hostname or ""):
+                    frame, content = fetch_page(target, {**headers, "Referer": urljoin(base, "/")})
+                    if source := advertised_media(content, ProviderMarkup(content), frame):
+                        return source
+                raise BrowserPlayerOnly
     except (binascii.Error, UnicodeError):
         pass
     return ""
@@ -788,18 +823,25 @@ class TunerHandler(BaseHTTPRequestHandler):
             [(provider, channel.provider_urls[provider])
              for provider in SCRAPER_PROVIDERS if provider in channel.provider_urls]
         )
+        if override := CHANNEL_SOURCE_OVERRIDES.get(channel.tvg_id.strip().casefold()):
+            candidates.insert(0, ("ChannelOverride", override))
         for provider, url in candidates:
             label = provider or "CustomM3U"
             self.tune_source = (channel.name, label)
             print(f"INFO: Trying '{channel.name}' via '{label}'.", flush=True)
             headers = get_provider_headers(provider)
             try:
-                target = resolve_candidate(provider, url, headers, custom=custom)
+                target = url if provider == "ChannelOverride" else resolve_candidate(provider, url, headers, custom=custom)
                 if http_url("", target) and self.stream_candidate(target, headers):
                     return
+            except BrowserPlayerOnly:
+                print(f"WARNING: Source '{label}' advertises a browser player without a direct stream URL.", flush=True)
             except UPSTREAM_ERRORS as error:
-                code = f" HTTP {error.code}" if isinstance(error, HTTPError) else ""
-                print(f"WARNING: Source '{label}' failed ({type(error).__name__}{code}).", flush=True)
+                if isinstance(error, HTTPError) and error.headers and error.headers.get("CF-Mitigated", "").lower() == "challenge":
+                    print(f"WARNING: Source '{label}' requires a browser challenge (HTTP {error.code}).", flush=True)
+                else:
+                    code = f" HTTP {error.code}" if isinstance(error, HTTPError) else ""
+                    print(f"WARNING: Source '{label}' failed ({type(error).__name__}{code}).", flush=True)
             print(f"INFO: No playable stream from '{label}'; trying the next source.", flush=True)
         self.send_error(HTTPStatus.BAD_GATEWAY, "No configured source could start this channel")
 

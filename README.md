@@ -56,6 +56,22 @@ In auto-discovery mode, ScrapeTuner reads each provider's own channel listing an
 * A successful HTTP status is not enough: a source must return a playable HLS playlist or MPEG-TS data. An HTML player/error page, an invalid manifest, or a remuxer that produces no initial data triggers the next candidate. The tuner logs the provider that starts playback. If all candidates fail, it returns HTTP 502. Once playback has started, the tuner does not switch sources within that connection.
 * Auto-discovery is used only when there is no custom `channels.m3u`. A custom playlist uses the URLs you provide, without auto-discovery failover.
 
+#### Use a direct stream for one channel
+
+A channel can play on a provider's website but still be unavailable to the tuner: the site may require a browser challenge or load the video in JavaScript without advertising a direct stream.
+
+To use your own or an explicitly authorized direct HTTP(S) HLS or MPEG-TS source, add `CHANNEL_SOURCE_OVERRIDES` to the existing `config.json`. Use the channel's `tvg-id` from the tuner's `/playlist.m3u` (for example, `iptv-voxup` for VOXup):
+
+```json
+{
+  "CHANNEL_SOURCE_OVERRIDES": {
+    "iptv-voxup": "https://example.invalid/your-authorized-stream.m3u8"
+  }
+}
+```
+
+Restart the tuner after editing. The URL is tried first for that channel; if it fails, the tuner tries the usual sources. This does not add, remove, or renumber channels.
+
 ### Optional Real-Time Video Upscaling & Sharpening (Experimental)
 > [!IMPORTANT]
 > **This feature is experimental.** Transcoding live streams in real-time is extremely resource-intensive. Depending on your NAS CPU performance and stream conditions, **it can lead to errors, stream stuttering, buffering, or high CPU spikes.**
