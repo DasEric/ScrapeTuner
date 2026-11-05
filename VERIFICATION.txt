@@ -1,0 +1,127 @@
+ScrapeTuner - Wiedergabepruefung 2026-11-05 (Europe/Berlin)
+
+BASELINE: Commit 8e5cb57; original app.py SHA-256:
+C6435736E1F243391E67B3EC1EED6F592E127C670810DC4BA88609A2EA2E30FF
+Baseline-Volltest: 77 Eintraege, 50 Starts mit MPEG-TS und Bild/Ton.
+
+MODIFIED: 77 Eintraege, 51 mit HTTP 200, MPEG-TS, Video und Audio.
+NACHTEST nach Audio-Korrektur: SUPER RTL und RTLZWEI liefern ueber livedetv Video h264 + Audio aac (HTTP 200).
+GESAMTERGEBNIS aus Volltest und diesen beiden Nachtests: 53/77 mit Bild und Ton, 24 weiterhin ohne bestaetigte Wiedergabe.
+Alle konfigurierten Anbieter, Reihenfolge: 2ix2tv,livedetv,lolmt2,2ix2.
+Kein channels.m3u, keine CHANNEL_SOURCE_OVERRIDES im Test.
+Pruefung: GET /stream/INDEX am lokalen ThreadingHTTPServer, 601600 Bytes pro Start.
+FFprobe-Befehl je Stichprobe:
+ffprobe -v error -f mpegts -show_entries stream=codec_type,codec_name -of json -i pipe:0
+Input: vom Tuner gelieferte Stream-Bytes; Ergebnisse je Sender unten.
+Der Volltest ist eine Momentaufnahme und kein Dauerverfuegbarkeitsnachweis.
+HTTP 200 allein zaehlt nicht als Bild/Ton-Erfolg.
+
+ROLLBACK: Original auf einer separaten temporaeren Kopie wiederhergestellt.
+Originalhash sowie vorheriges Verwerfen von playlist.php und CSV reproduziert.
+Die geaenderte Arbeitsdatei bleibt erhalten. Fixture- und Rollback-Tests: Exit 0.
+
+Geaenderte Bereiche: Provider-Katalogcache, Player-/Mirror-Aufloesung,
+PHP-HLS, Segmentformate, PMT-Audiopruefung, FFmpeg-Start/Stillstand.
+
+Index | Sender-ID | Sender | HTTP/Ergebnis | Codecs | Bild+Ton | Sekunden
+0 | DasErste.de | Das Erste | 200 | video:h264, audio:aac | JA | 4.1
+1 | ZDF.de | ZDF | 200 | video:h264, audio:aac | JA | 4.0
+2 | ProSieben.de | Prosieben | 200 | video:h264, audio:aac | JA | 8.1
+3 | Sat1.de | Sat.1 | 200 | video:h264, audio:aac | JA | 1.0
+4 | 3sat.de | 3sat | 200 | video:h264, audio:aac | JA | 3.3
+5 | Arte.de | arte | 200 | video:h264, audio:aac | JA | 0.8
+6 | KabelEins.de | Kabel-Eins | 200 | video:h264, audio:aac | JA | 8.2
+7 | ProSiebenMaxx.de | Prosieben-Maxx | 200 | video:h264, audio:aac | JA | 1.2
+8 | Sixx.de | sixx | 200 | video:h264, audio:aac | JA | 8.1
+9 | Sat1Gold.de | Sat1-Gold | 200 | video:h264, audio:aac | JA | 8.0
+10 | BRFernsehenSued.de | Br | 200 | video:h264, audio:aac | JA | 2.5
+11 | hrfernsehen.de | Hr | 200 | video:h264, audio:aac | JA | 7.0
+12 | WDRKoeln.de | Wdr | 200 | video:h264, audio:aac | JA | 3.1
+13 | NDRHamburg.de | Ndr | 200 | video:h264, audio:aac | JA | 2.3
+14 | MDRSachsen.de | Mdr | 200 | video:h264, audio:aac | JA | 3.2
+15 | SWRFernsehenBW.de | Swr | 200 | video:h264, audio:aac | JA | 2.8
+16 | rbbBerlin.de | Rbb | 200 | video:h264, audio:aac | JA | 7.8
+17 | Phoenix.de | PHOENIX | 200 | video:h264, audio:aac | JA | 3.4
+18 | ZDFneo.de | Zdf-Neo | 200 | video:h264, audio:aac | JA | 3.6
+19 | One.de | One | 200 | video:h264, audio:aac | JA | 3.3
+20 | iptv-bralpha | Br-Alpha | 200 | video:h264, audio:aac | JA | 2.2
+21 | Welt.de | WELT | 200 | video:h264, audio:aac | JA | 0.8
+22 | ZDFinfo.de | Zdf-Info | 200 | video:h264, audio:aac | JA | 3.5
+23 | iptv-deutschewelle | Deutsche-Welle | 200 | video:h264, audio:aac | JA | 0.9
+24 | Sport1.de | SPORT1 | 502 | - | NEIN | 3.2
+25 | DMAX.de | DMAX | 200 | video:h264, audio:aac | JA | 1.0
+26 | TLC.de | TLC | 200 | video:h264, audio:aac | JA | 0.9
+27 | Tele5.de | Tele-5 | 200 | video:h264, audio:aac | JA | 1.1
+28 | KiKa.de | KiKa | 200 | video:h264, audio:aac | JA | 2.6
+29 | Nickelodeon.de | Nickelodeon | 200 | video:h264, audio:aac | JA | 0.9
+30 | ComedyCentralGermany.de | Comedy-Central | 200 | video:h264, audio:aac | JA | 1.9
+31 | DisneyChannel.de | Disney-Channel | 200 | video:h264, audio:aac | JA | 1.8
+32 | n-tv.de | Ntv | 200 | video:h264, audio:aac | JA | 8.0
+33 | KabelEinsDoku.de | Kabel-Eins-Doku | 200 | video:h264, audio:aac | JA | 1.0
+34 | SuperRTL.de | Super-Rtl | 200 | video:h264, audio:aac | JA | Nachtest nach Audio-Fix
+35 | RTLNitro.de | Rtl-Nitro | 200 | video:h264, audio:aac | JA | 8.0
+36 | RTL.de | RTL | 200 | video:h264, audio:aac | JA | 1.9
+37 | RTLZwei.de | RTLZWEI | 200 | video:h264, audio:aac | JA | Nachtest nach Audio-Fix
+38 | Vox.de | VOX | 200 | video:h264, audio:aac | JA | 8.0
+39 | iptv-hgtv | Hgtv | 502 | - | NEIN | 1.0
+40 | iptv-rtlup | Rtlup | 200 | video:h264, audio:aac | JA | 2.4
+41 | iptv-voxup | Voxup | 200 | video:h264, audio:aac | JA | 0.9
+42 | iptv-eurosport1 | Eurosport1 | 502 | - | NEIN | 1.3
+43 | DeluxeMusic.de | Deluxe-Music | 200 | video:h264, audio:aac | JA | 2.1
+44 | iptv-df1 | Df1 | 200 | video:h264, audio:aac | JA | 0.8
+45 | iptv-servus | Servus-Tv | 200 | video:h264, audio:aac | JA | 1.0
+46 | iptv-orf1 | Orf-1 | 502 | - | NEIN | 1.5
+47 | iptv-orf2 | Orf-2 | 502 | - | NEIN | 9.0
+48 | iptv-srf2 | Srf2 | 502 | - | NEIN | 1.4
+49 | iptv-skynewssporthd | Sky News Sport Hd | 502 | - | NEIN | 1.9
+50 | Tagesschau24.de | tagesschau24 | 200 | video:h264, audio:aac | JA | 1.6
+51 | iptv-fs1 | Fs1 | 200 | video:h264, audio:aac | JA | 1.7
+52 | iptv-weltderwunder | Welt Der Wunder | 200 | video:h264, audio:aac | JA | 2.3
+53 | iptv-alexberlin | Alex Berlin | 200 | video:h264, audio:aac | JA | 1.7
+54 | MTVGermany.de | MTV | 502 | - | NEIN | 1.7
+55 | iptv-bloomberg | Bloomberg | 200 | video:h264, audio:aac | JA | 1.4
+56 | SRFernsehen.de | SR Fernsehen | 200 | video:h264, audio:aac | JA | 2.4
+57 | iptv-radiobremen | Radio-Bremen-Tv | 200 | video:h264, audio:aac | JA | 2.2
+58 | iptv-alpha | Alpha | 200 | video:h264, audio:aac | JA | 2.9
+59 | iptv-n24doku | N24 Doku | 502 | - | NEIN | 5.2
+60 | iptv-alex | Alex | 200 | video:h264, audio:aac | JA | 1.2
+61 | iptv-redbull | Redbull | 200 | video:h264, audio:aac | JA | 0.9
+62 | iptv-skysportnewshdsnhd | Sky Sport News Hd | 502 | - | NEIN | 0.1
+63 | iptv-mdf1 | Mdf 1 | 502 | - | NEIN | 0.1
+64 | iptv-srf1 | Srf 1 | 502 | - | NEIN | 0.2
+65 | iptv-srfinfo | Srf Info | 502 | - | NEIN | 0.2
+66 | iptv-3plus | 3 Plus | 502 | - | NEIN | 0.2
+67 | iptv-4plus | 4 Plus | 502 | - | NEIN | 0.2
+68 | iptv-5plus | 5 Plus | 502 | - | NEIN | 0.2
+69 | iptv-6plus | 6 Plus | 502 | - | NEIN | 0.2
+70 | iptv-orf3 | ORF III | 502 | - | NEIN | 0.1
+71 | iptv-laendle | Ländle Tv | 502 | - | NEIN | 0.2
+72 | iptv-m4tv | M4Tv | 502 | - | NEIN | 0.2
+73 | iptv-w24 | W24 Tv | 502 | - | NEIN | 0.2
+74 | iptv-tirol | Tirol Tv | 502 | - | NEIN | 0.2
+75 | iptv-okto | Okto Tv | 502 | - | NEIN | 0.2
+76 | iptv-dorf | Dorf Tv | 502 | - | NEIN | 0.2
+
+Feststellungen aus der Quellenpruefung:
+- RTLup: Neue 2ix2-Quelle war in alten Senderkatalogen noch nicht enthalten.
+- MTV: 2ix2 zeigt [php_everywhere]; livedetv liefert einen Cloudinary-Demo-Player.
+- Mehrere AT/CH- und Regionalsender: 404/502 oder leere Player beim Anbieter.
+- Keine Umnummerierung, kein Ausblenden fehlerhafter Sender und kein Ersatz durch andere Programme.
+
+Geaenderte Dateien:
+C:\Users\Eric\Documents\GitHub\ScrapeTuner\app.py
+C:\Users\Eric\Documents\GitHub\ScrapeTuner\README.md
+C:\Users\Eric\Documents\GitHub\ScrapeTuner\VERIFICATION.txt
+
+Zusaetzliche abgeschlossene Regressionstests (python - ueber Standardeingabe, Exit 0):
+- PHP-Endpunkt: BASELINE leer, MODIFIED URL erhalten, ROLLBACK wieder leer.
+- BMP/CSV: Original-TS bytegleich; beschaedigte Eingaben verworfen.
+- PAT/PMT: Eine Audiodeklaration ohne Audio-PES reicht nicht aus.
+- Player: Der deklarierte gleiche-Sender-Mirror bleibt nach einem Fehler erreichbar.
+- Katalogcache: Abrufe bei t=0 und t=301s, kein neuer Abruf bei t=100s.
+- Neue RTLup-Quelle uebernommen, GuideNumber unveraendert, keine Sender ausgeblendet.
+- Katalogausfall: bisherige Quellen behalten; keine erneuten Abfragen bei jedem Client.
+- FFmpeg: EOF bereinigt Prozess/Reader; leere Ausgabe sendet kein HTTP 200.
+
+Geaenderte Arbeitsdatei SHA-256: A977C6DD3CB5EB8C052C9FBB7CC687B83473B0551C86EE0DB5A9B7D0D27ACB86
+Branch: main (kein Commit erstellt).

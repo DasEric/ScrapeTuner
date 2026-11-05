@@ -20,10 +20,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html.parser import HTMLParser
 from itertools import islice
 from pathlib import Path
-from queue import Empty, Queue
-from threading import Thread
+from queue import Empty, Full, Queue
+from threading import Event, Lock, Thread
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, unquote, urljoin, urlparse
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 from urllib.request import Request, urlopen, HTTPRedirectHandler, HTTPCookieProcessor, build_opener
 
 PORT = int(os.environ.get("PORT", "5004"))
@@ -109,7 +109,10 @@ PROVIDER_ALIASES = {
     urlparse(url).hostname.removeprefix("www."): key for key, url in PROVIDER_HOME.items()
 }
 TILE_PROVIDERS = {"2ix2tv", "lolmt2", "nydus", "raidrush"}
-TILE_EMBED_HOST = re.compile(r"s\d+\.(?:2ix2tv|2ix2com)\.de")
+TILE_EMBED_HOST = re.compile(
+    r"s\d+\.(?:2ix2tv|2ix2com|2ix2-alternative|mysql-export-crypt|mysql2dumpcrypt|"
+    r"cryptstream|tv24livestream[12]?)\.de"
+)
 
 
 def normalize_providers(values: list[str]) -> list[str]:
@@ -302,6 +305,9 @@ def lookup_epg_id(slug: str) -> str:
 # Global Cache for Scraped Playlists
 _aggregated_channels_cache: list[Channel] = []
 _last_scraped_time: float = 0.0
+_provider_catalogs: dict[str, tuple[float, dict[str, Channel]]] = {}
+_provider_catalog_locks = {provider: Lock() for provider in PROVIDER_HOME}
+PROVIDER_REFRESH_SECONDS = 300
 
 
 class ProviderMarkup(HTMLParser):
@@ -452,6 +458,35 @@ def discover_provider(provider: str) -> list[Channel]:
     return list(channels.values())
 
 
+def provider_catalog(provider: str) -> dict[str, Channel]:
+    """Refresh source URLs independently of the stable, numbered tuner lineup."""
+    with _provider_catalog_locks[provider]:
+        now = time.monotonic()
+        checked, previous = _provider_catalogs.get(provider, (float("-inf"), {}))
+        if now - checked < PROVIDER_REFRESH_SECONDS:
+            return previous
+        try:
+            channels = discover_provider(provider)
+            current = {channel.tvg_id.casefold(): channel for channel in channels}
+        except UPSTREAM_ERRORS as error:
+            print(f"WARNING: Channel discovery for '{provider}' failed ({type(error).__name__}).", flush=True)
+            current = {}
+        # Keep the previous URLs during an outage; cache failures to avoid a
+        # network retry for every client request.
+        catalog = current or previous
+        _provider_catalogs[provider] = now, catalog
+        return catalog
+
+
+def channel_provider_urls(channel: Channel) -> dict[str, str]:
+    urls = dict(channel.provider_urls)
+    for provider in SCRAPER_PROVIDERS:
+        fresh = provider_catalog(provider).get(channel.tvg_id.casefold())
+        if fresh:
+            urls.update(fresh.provider_urls)
+    return urls
+
+
 PLAYER_SOURCE = re.compile(r"""\b(?:file|source)\s*:\s*(['"])([^'"]+)\1""", re.I)
 HLS_LITERAL = re.compile(r"""((?:https?://|//|/|\.\.?/)[^\s"'<>]+?\.m3u8(?:[?#][^\s"'<>]*)?)""", re.I)
 
@@ -496,6 +531,8 @@ def advertised_wrapped_hls(page: str, base: str) -> WrappedHls | None:
     if not match:
         return None
     data, _ = json.JSONDecoder().raw_decode(page, match.end())
+    if not isinstance(data, dict):
+        return None
     source, offset = data.get("streamUrl"), data.get("hostLengthOffset")
     if not isinstance(source, str) or type(offset) is not int or not 0 <= offset <= 64:
         return None
@@ -504,8 +541,7 @@ def advertised_wrapped_hls(page: str, base: str) -> WrappedHls | None:
     return stream if stream.allows(url) and urlparse(url).path == "/conv/conv.php" else None
 
 
-def resolve_tile_stream(player_url: str, headers: dict[str, str]) -> str | WrappedHls:
-    base, page = fetch_page(player_url, headers)
+def tile_source(base: str, page: str, headers: dict[str, str]) -> str | WrappedHls:
     markup = ProviderMarkup(page)
     if source := advertised_media(page, markup, base):
         return source
@@ -539,9 +575,44 @@ def resolve_tile_stream(player_url: str, headers: dict[str, str]) -> str | Wrapp
                     if wrapped := advertised_wrapped_hls(content, frame):
                         return wrapped
                 raise BrowserPlayerOnly
+            if target:
+                # Several legitimate HLS endpoints end in playlist.php. Playback
+                # validates their contents instead of relying on the extension.
+                return target
     except (binascii.Error, UnicodeError):
         pass
     return ""
+
+
+def tile_candidates(player_url: str, headers: dict[str, str]):
+    pending = [player_url]
+    visited = set()
+    emitted = set()
+    original_id = parse_qs(urlparse(player_url).query).get("id", [""])[0]
+    while pending and len(visited) < 2:
+        url = pending.pop(0)
+        if url in visited:
+            continue
+        visited.add(url)
+        try:
+            base, page = fetch_page(url, headers)
+            # Follow only the replacement-player button actually advertised by
+            # this channel; never invent mirror IDs or try a different channel.
+            for match in re.finditer(r"""\bmirr_url\s*=\s*(['"])([^'"]+)\1""", page):
+                mirror = http_url(base, match[2])
+                parsed = urlparse(mirror)
+                mirror_id = parse_qs(parsed.query).get("id", [""])[0]
+                if (parsed.scheme == "https" and parsed.netloc == urlparse(base).netloc
+                        and parsed.path == urlparse(base).path
+                        and mirror_id == original_id.removesuffix("_mirror") + "_mirror"):
+                    pending.append(mirror)
+            source = tile_source(base, page, headers)
+            if source and source not in emitted:
+                emitted.add(source)
+                yield source
+        except UPSTREAM_ERRORS as error:
+            # An unusable primary frame must not suppress its advertised mirror.
+            TunerHandler.log_source_error("player", error)
 
 
 def livedetv_candidates(channel_url: str, headers: dict[str, str]):
@@ -598,7 +669,7 @@ def resolve_candidates(provider: str, url: str, headers: dict[str, str], *, cust
             base, page = fetch_page(PROVIDER_HOME[provider], headers)
             url = tile_player(page, base, slug)
         if url:
-            yield resolve_tile_stream(url, headers)
+            yield from tile_candidates(url, headers)
     elif provider == "livedetv":
         yield from livedetv_candidates(url, headers)
     elif provider == "2ix2":
@@ -637,7 +708,7 @@ def parse_playlist() -> list[Channel]:
 
     for provider in SCRAPER_PROVIDERS:
         try:
-            scraped = discover_provider(provider)
+            scraped = list(provider_catalog(provider).values())
         except UPSTREAM_ERRORS as error:
             print(f"WARNING: Channel discovery for '{provider}' failed ({type(error).__name__}).", flush=True)
             continue
@@ -731,6 +802,66 @@ def is_mpeg_ts(prefix: bytes) -> bool:
     return len(prefix) >= 2 * TS_PACKET and prefix[0] == prefix[TS_PACKET] == 0x47
 
 
+def ts_has_audio(data: bytes) -> bool:
+    """Require an audio PES packet, not just an audio declaration in the PMT."""
+    buffers: dict[int, bytes] = {}
+    pmt_pids = set()
+    audio_pids = set()
+    for start in range(0, len(data), TS_PACKET):
+        packet = data[start:start + TS_PACKET]
+        if len(packet) != TS_PACKET or packet[0] != 0x47 or packet[1] & 0x80:
+            continue
+        pid = ((packet[1] & 0x1F) << 8) | packet[2]
+        if pid != 0 and pid not in pmt_pids and pid not in audio_pids:
+            continue
+        control = (packet[3] >> 4) & 3
+        if control not in (1, 3):
+            continue
+        offset = 4 + (1 + packet[4] if control == 3 else 0)
+        payload = packet[offset:]
+        if not payload:
+            continue
+        if pid in audio_pids:
+            if (len(payload) >= 4 and packet[1] & 0x40 and payload.startswith(b"\0\0\1")
+                    and (0xC0 <= payload[3] <= 0xDF or payload[3] in (0xBD, 0xFD))):
+                return True
+            continue
+        if packet[1] & 0x40:
+            pointer = payload[0] + 1
+            buffers[pid] = payload[pointer:]
+        elif pid in buffers:
+            buffers[pid] += payload
+        section = buffers.get(pid, b"")
+        if len(section) < 3:
+            continue
+        length = 3 + (((section[1] & 15) << 8) | section[2])
+        if length < 8 or length > 1024 or len(section) < length:
+            continue
+        section = section[:length - 4]  # Ignore the section CRC.
+        buffers.pop(pid, None)
+        if pid == 0 and section[0] == 0:
+            for pos in range(8, len(section) - 3, 4):
+                if section[pos:pos + 2] != b"\0\0":
+                    pmt_pids.add(((section[pos + 2] & 31) << 8) | section[pos + 3])
+        elif pid in pmt_pids and section[0] == 2 and len(section) >= 12:
+            pos = 12 + (((section[10] & 15) << 8) | section[11])
+            while pos + 5 <= len(section):
+                stream_type = section[pos]
+                stream_pid = ((section[pos + 1] & 31) << 8) | section[pos + 2]
+                info_length = ((section[pos + 3] & 15) << 8) | section[pos + 4]
+                if stream_type in (0x03, 0x04, 0x0F, 0x11, 0x81, 0x87):
+                    audio_pids.add(stream_pid)
+                if stream_type == 0x06:
+                    descriptors = section[pos + 5:pos + 5 + info_length]
+                    index = 0
+                    while index + 2 <= len(descriptors):
+                        if descriptors[index] in (0x6A, 0x7A, 0x7B, 0x7C):
+                            audio_pids.add(stream_pid)
+                        index += 2 + descriptors[index + 1]
+                pos += 5 + info_length
+    return False
+
+
 def read_stream_prefix(response) -> tuple[list[str], bytes]:
     """Recognize a manifest by its contents, never by its URL or MIME type."""
     prefix = response.read(512)
@@ -813,14 +944,29 @@ def wrapped_opener(source: WrappedHls):
 
 
 def read_wrapped_segment(response, offset: int) -> bytes:
-    """Read the unencrypted TS payload carried as hex in this player's BMP envelope."""
-    if not urlparse(response.url).path.lower().endswith(".tsl.bmp"):
+    """Read the payload using the public player's format, then validate every TS packet."""
+    path = urlparse(response.url).path.lower()
+    if not path.endswith((".tsl.bmp", ".tsl.csv", ".tsl.woff", ".ts")):
         return b""
     payload = response.read(MAX_WRAPPED_SEGMENT_BYTES + 1)
-    if len(payload) > MAX_WRAPPED_SEGMENT_BYTES or not payload.startswith(b"BM"):
+    if len(payload) > MAX_WRAPPED_SEGMENT_BYTES:
         return b""
     try:
-        data = binascii.unhexlify(payload[offset:])
+        if path.endswith(".ts"):
+            data = payload
+        elif path.endswith(".tsl.bmp") and payload.startswith(b"BM"):
+            data = binascii.unhexlify(payload[offset:])
+        elif path.endswith(".tsl.csv"):
+            fields = re.split(rb",|\r?\n", payload[offset - 24:])
+            data = base64.b64decode(b"".join(reversed(fields)), validate=True)
+        elif path.endswith(".tsl.woff"):
+            size = max(0, len(payload) - 13) * 4
+            if size > MAX_WRAPPED_SEGMENT_BYTES:
+                return b""
+            data = bytearray(size)
+            data[3::4] = payload[13:]
+        else:
+            return b""
     except binascii.Error:
         return b""
     if (
@@ -915,10 +1061,12 @@ class TunerHandler(BaseHTTPRequestHandler):
 
     def tune(self, channel: Channel) -> None:
         custom = not channel.provider_urls
+        self.require_audio = not custom
+        provider_urls = {} if custom else channel_provider_urls(channel)
         candidates = (
             [(provider_for_url(channel.url), channel.url)] if custom else
-            [(provider, channel.provider_urls[provider])
-             for provider in SCRAPER_PROVIDERS if provider in channel.provider_urls]
+            [(provider, provider_urls[provider])
+             for provider in SCRAPER_PROVIDERS if provider in provider_urls]
         )
         if override := CHANNEL_SOURCE_OVERRIDES.get(channel.tvg_id.strip().casefold()):
             candidates.insert(0, ("ChannelOverride", override))
@@ -944,6 +1092,9 @@ class TunerHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def log_source_error(label: str, error: Exception) -> None:
+        if isinstance(error, BrowserPlayerOnly):
+            print(f"WARNING: Source '{label}' has no directly readable player source.", flush=True)
+            return
         if isinstance(error, HTTPError):
             if error.headers and error.headers.get("CF-Mitigated", "").lower() == "challenge":
                 print(f"WARNING: Source '{label}' requires a browser challenge (HTTP {error.code}).", flush=True)
@@ -1020,10 +1171,12 @@ class TunerHandler(BaseHTTPRequestHandler):
                 "-nostdin",
                 "-rw_timeout", "5000000",
                 "-headers", headers_str,
-                "-re",
                 "-f", "hls",
                 "-i", m3u8_url
             ]
+            if getattr(self, "require_audio", False):
+                # A video-only variant must not mask a working TV source with sound.
+                cmd.extend(["-map", "0:v:0", "-map", "0:a:0"])
             
             if TRANSCODE_UPSCALING:
                 # Parse target resolution dimensions
@@ -1075,18 +1228,29 @@ class TunerHandler(BaseHTTPRequestHandler):
                 print(f"WARNING: FFmpeg launch failed ({type(error).__name__}).", flush=True)
                 return False
 
-            first_chunk = Queue(maxsize=1)
+            chunks = Queue(maxsize=4)
+            stopped = Event()
 
-            def read_start() -> None:
-                try:
-                    first_chunk.put(proc.stdout.read1(64 * 1024))
-                except OSError:
-                    first_chunk.put(b"")
+            def read_output() -> None:
+                while not stopped.is_set():
+                    try:
+                        chunk = proc.stdout.read1(64 * 1024)
+                    except OSError:
+                        chunk = b""
+                    while not stopped.is_set():
+                        try:
+                            chunks.put(chunk, timeout=0.25)
+                            break
+                        except Full:
+                            continue
+                    if not chunk:
+                        return
 
-            Thread(target=read_start, daemon=True).start()
+            reader = Thread(target=read_output, daemon=True)
+            reader.start()
             try:
                 try:
-                    chunk = first_chunk.get(timeout=12)
+                    chunk = chunks.get(timeout=12)
                 except Empty:
                     print("WARNING: FFmpeg timed out before producing stream data.", flush=True)
                     return False
@@ -1097,11 +1261,16 @@ class TunerHandler(BaseHTTPRequestHandler):
                     self.begin_ts_response()
                     while chunk:
                         self.wfile.write(chunk)
-                        chunk = proc.stdout.read1(64 * 1024)
+                        try:
+                            chunk = chunks.get(timeout=20)
+                        except Empty:
+                            print("WARNING: FFmpeg stopped producing stream data; closing the client stream.", flush=True)
+                            break
                 except OSError:
                     pass
                 return True
             finally:
+                stopped.set()
                 if proc.poll() is None:
                     proc.terminate()
                 try:
@@ -1110,6 +1279,7 @@ class TunerHandler(BaseHTTPRequestHandler):
                     proc.kill()
                     proc.wait()
                 proc.stdout.close()
+                reader.join(timeout=1)
 
         return self.stream_ts_segments(m3u8_url, stream_headers)
 
@@ -1148,6 +1318,9 @@ class TunerHandler(BaseHTTPRequestHandler):
                                 data = prefix if is_mpeg_ts(prefix) else b""
                             if not data:
                                 continue
+                            if wrapped and not started and not ts_has_audio(data):
+                                print("WARNING: Wrapped TV source has no audio track; trying another source.", flush=True)
+                                return False
                             if not started:
                                 started = True
                                 self.begin_ts_response()
